@@ -90,6 +90,68 @@ func TestCheckpointStateRestore(t *testing.T) {
 			},
 		},
 		{
+			"Restore valid checkpoint with service pool metadata",
+			`{
+				"policyName": "static",
+				"defaultCPUSet": "0,4-7",
+				"entries": {
+					"pod-a": {
+						"container1": "1-3"
+					}
+				},
+				"containerEntries": {
+					"pod-a": {
+						"container1": {
+							"assignmentType": "service-pooled"
+						}
+					}
+				},
+				"serviceEntries": {
+					"service-a": {
+						"cpuSet": "1-3",
+						"requestedCPUs": 3
+					}
+				},
+				"podServiceEntries": {
+					"pod-a": {
+						"service": "service-a",
+						"requestedCPUs": 3
+					}
+				},
+				"checksum": 0
+			}`,
+			"static",
+			containermap.ContainerMap{},
+			"",
+			&stateMemory{
+				assignments: ContainerCPUAssignments{
+					"pod-a": {
+						"container1": cpuset.New(1, 2, 3),
+					},
+				},
+				containerAssignments: ContainerAssignments{
+					"pod-a": {
+						"container1": {
+							AssignmentType: CPUAssignmentServicePool,
+						},
+					},
+				},
+				serviceAssignments: ServiceCPUAssignments{
+					"service-a": {
+						CPUSet:        cpuset.New(1, 2, 3),
+						RequestedCPUs: 3,
+					},
+				},
+				podServiceAssignments: PodServiceAssignments{
+					"pod-a": {
+						Service:       "service-a",
+						RequestedCPUs: 3,
+					},
+				},
+				defaultCPUSet: cpuset.New(0, 4, 5, 6, 7),
+			},
+		},
+		{
 			"Restore checkpoint with invalid checksum",
 			`{
 				"policyName": "none",
@@ -254,6 +316,36 @@ func TestCheckpointStateStore(t *testing.T) {
 				},
 			},
 		},
+		{
+			"Store assignments with service pool metadata",
+			&stateMemory{
+				assignments: ContainerCPUAssignments{
+					"pod": {
+						"container1": cpuset.New(1, 5, 8),
+					},
+				},
+				containerAssignments: ContainerAssignments{
+					"pod": {
+						"container1": {
+							AssignmentType: CPUAssignmentServicePool,
+						},
+					},
+				},
+				serviceAssignments: ServiceCPUAssignments{
+					"service-a": {
+						CPUSet:        cpuset.New(1, 5, 8),
+						RequestedCPUs: 3,
+					},
+				},
+				podServiceAssignments: PodServiceAssignments{
+					"pod": {
+						Service:       "service-a",
+						RequestedCPUs: 3,
+					},
+				},
+				defaultCPUSet: cpuset.New(0, 2, 3, 4, 6, 7),
+			},
+		},
 	}
 
 	// create temp dir
@@ -281,6 +373,9 @@ func TestCheckpointStateStore(t *testing.T) {
 			// set values of cs1 instance so they are stored in checkpoint and can be read by cs2
 			cs1.SetDefaultCPUSet(tc.expectedState.defaultCPUSet)
 			cs1.SetCPUAssignments(tc.expectedState.assignments)
+			cs1.SetContainerAssignments(tc.expectedState.containerAssignments)
+			cs1.SetServiceCPUAssignments(tc.expectedState.serviceAssignments)
+			cs1.SetPodServiceAssignments(tc.expectedState.podServiceAssignments)
 
 			// restore checkpoint with previously stored values
 			cs2, err := NewCheckpointState(testingDir, testingCheckpoint, "none", nil)
@@ -429,5 +524,23 @@ func AssertStateEqual(t *testing.T, sf State, sm State) {
 	cpuassignmentSm := sm.GetCPUAssignments()
 	if !reflect.DeepEqual(cpuassignmentSf, cpuassignmentSm) {
 		t.Errorf("State CPU assignments mismatch. Have %s, want %s", cpuassignmentSf, cpuassignmentSm)
+	}
+
+	containerAssignmentsSf := sf.GetContainerAssignments()
+	containerAssignmentsSm := sm.GetContainerAssignments()
+	if !reflect.DeepEqual(containerAssignmentsSf, containerAssignmentsSm) {
+		t.Errorf("State container assignments mismatch. Have %v, want %v", containerAssignmentsSf, containerAssignmentsSm)
+	}
+
+	serviceAssignmentsSf := sf.GetServiceCPUAssignments()
+	serviceAssignmentsSm := sm.GetServiceCPUAssignments()
+	if !reflect.DeepEqual(serviceAssignmentsSf, serviceAssignmentsSm) {
+		t.Errorf("State service assignments mismatch. Have %v, want %v", serviceAssignmentsSf, serviceAssignmentsSm)
+	}
+
+	podServiceAssignmentsSf := sf.GetPodServiceAssignments()
+	podServiceAssignmentsSm := sm.GetPodServiceAssignments()
+	if !reflect.DeepEqual(podServiceAssignmentsSf, podServiceAssignmentsSm) {
+		t.Errorf("State pod service assignments mismatch. Have %v, want %v", podServiceAssignmentsSf, podServiceAssignmentsSm)
 	}
 }

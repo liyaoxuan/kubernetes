@@ -35,6 +35,7 @@ const (
 	DistributeCPUsAcrossCoresOption string = "distribute-cpus-across-cores"
 	StrictCPUReservationOption      string = "strict-cpu-reservation"
 	PreferAlignByUnCoreCacheOption  string = "prefer-align-cpus-by-uncorecache"
+	ServiceCPUPoolsOption           string = "service-cpu-pools"
 )
 
 var (
@@ -44,6 +45,7 @@ var (
 		DistributeCPUsAcrossCoresOption,
 		StrictCPUReservationOption,
 		PreferAlignByUnCoreCacheOption,
+		ServiceCPUPoolsOption,
 	)
 	betaOptions = sets.New[string](
 		FullPCPUsOnlyOption,
@@ -95,6 +97,8 @@ type StaticPolicyOptions struct {
 	// Flag that makes best-effort to align CPUs to a uncorecache boundary
 	// As long as there are CPUs available, pods will be admitted if the condition is not met.
 	PreferAlignByUncoreCacheOption bool
+	// Flag to enable per-service shared CPU pools managed by the static policy.
+	ServiceCPUPools bool
 }
 
 // NewStaticPolicyOptions creates a StaticPolicyOptions struct from the user configuration.
@@ -142,6 +146,12 @@ func NewStaticPolicyOptions(policyOptions map[string]string) (StaticPolicyOption
 				return opts, fmt.Errorf("bad value for option %q: %w", name, err)
 			}
 			opts.PreferAlignByUncoreCacheOption = optValue
+		case ServiceCPUPoolsOption:
+			optValue, err := strconv.ParseBool(value)
+			if err != nil {
+				return opts, fmt.Errorf("bad value for option %q: %w", name, err)
+			}
+			opts.ServiceCPUPools = optValue
 		default:
 			// this should never be reached, we already detect unknown options,
 			// but we keep it as further safety.

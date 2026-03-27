@@ -25,8 +25,11 @@ import (
 
 type stateMemory struct {
 	sync.RWMutex
-	assignments   ContainerCPUAssignments
-	defaultCPUSet cpuset.CPUSet
+	assignments           ContainerCPUAssignments
+	containerAssignments  ContainerAssignments
+	serviceAssignments    ServiceCPUAssignments
+	podServiceAssignments PodServiceAssignments
+	defaultCPUSet         cpuset.CPUSet
 }
 
 var _ State = &stateMemory{}
@@ -35,8 +38,11 @@ var _ State = &stateMemory{}
 func NewMemoryState() State {
 	klog.InfoS("Initialized new in-memory state store")
 	return &stateMemory{
-		assignments:   ContainerCPUAssignments{},
-		defaultCPUSet: cpuset.New(),
+		assignments:           ContainerCPUAssignments{},
+		containerAssignments:  ContainerAssignments{},
+		serviceAssignments:    ServiceCPUAssignments{},
+		podServiceAssignments: PodServiceAssignments{},
+		defaultCPUSet:         cpuset.New(),
 	}
 }
 
@@ -68,6 +74,48 @@ func (s *stateMemory) GetCPUAssignments() ContainerCPUAssignments {
 	return s.assignments.Clone()
 }
 
+func (s *stateMemory) GetContainerAssignment(podUID string, containerName string) (ContainerAssignment, bool) {
+	s.RLock()
+	defer s.RUnlock()
+
+	res, ok := s.containerAssignments[podUID][containerName]
+	return res, ok
+}
+
+func (s *stateMemory) GetContainerAssignments() ContainerAssignments {
+	s.RLock()
+	defer s.RUnlock()
+	return s.containerAssignments.Clone()
+}
+
+func (s *stateMemory) GetServiceCPUAssignment(service string) (ServiceCPUAssignment, bool) {
+	s.RLock()
+	defer s.RUnlock()
+
+	res, ok := s.serviceAssignments[service]
+	return res, ok
+}
+
+func (s *stateMemory) GetServiceCPUAssignments() ServiceCPUAssignments {
+	s.RLock()
+	defer s.RUnlock()
+	return s.serviceAssignments.Clone()
+}
+
+func (s *stateMemory) GetPodServiceAssignment(podUID string) (PodServiceAssignment, bool) {
+	s.RLock()
+	defer s.RUnlock()
+
+	res, ok := s.podServiceAssignments[podUID]
+	return res, ok
+}
+
+func (s *stateMemory) GetPodServiceAssignments() PodServiceAssignments {
+	s.RLock()
+	defer s.RUnlock()
+	return s.podServiceAssignments.Clone()
+}
+
 func (s *stateMemory) SetCPUSet(podUID string, containerName string, cset cpuset.CPUSet) {
 	s.Lock()
 	defer s.Unlock()
@@ -96,6 +144,74 @@ func (s *stateMemory) SetCPUAssignments(a ContainerCPUAssignments) {
 	klog.InfoS("Updated CPUSet assignments", "assignments", a)
 }
 
+func (s *stateMemory) SetContainerAssignment(podUID string, containerName string, assignment ContainerAssignment) {
+	s.Lock()
+	defer s.Unlock()
+
+	if _, ok := s.containerAssignments[podUID]; !ok {
+		s.containerAssignments[podUID] = make(map[string]ContainerAssignment)
+	}
+
+	s.containerAssignments[podUID][containerName] = assignment
+	klog.InfoS("Updated container CPU assignment metadata", "podUID", podUID, "containerName", containerName, "assignment", assignment)
+}
+
+func (s *stateMemory) SetContainerAssignments(assignments ContainerAssignments) {
+	s.Lock()
+	defer s.Unlock()
+
+	s.containerAssignments = assignments.Clone()
+	klog.InfoS("Updated container CPU assignment metadata", "assignments", assignments)
+}
+
+func (s *stateMemory) SetServiceCPUAssignment(service string, assignment ServiceCPUAssignment) {
+	s.Lock()
+	defer s.Unlock()
+
+	s.serviceAssignments[service] = assignment
+	klog.InfoS("Updated service CPU assignment", "service", service, "assignment", assignment)
+}
+
+func (s *stateMemory) SetServiceCPUAssignments(assignments ServiceCPUAssignments) {
+	s.Lock()
+	defer s.Unlock()
+
+	s.serviceAssignments = assignments.Clone()
+	klog.InfoS("Updated service CPU assignments", "assignments", assignments)
+}
+
+func (s *stateMemory) DeleteServiceCPUAssignment(service string) {
+	s.Lock()
+	defer s.Unlock()
+
+	delete(s.serviceAssignments, service)
+	klog.V(2).InfoS("Deleted service CPU assignment", "service", service)
+}
+
+func (s *stateMemory) SetPodServiceAssignment(podUID string, assignment PodServiceAssignment) {
+	s.Lock()
+	defer s.Unlock()
+
+	s.podServiceAssignments[podUID] = assignment
+	klog.InfoS("Updated pod service assignment", "podUID", podUID, "assignment", assignment)
+}
+
+func (s *stateMemory) SetPodServiceAssignments(assignments PodServiceAssignments) {
+	s.Lock()
+	defer s.Unlock()
+
+	s.podServiceAssignments = assignments.Clone()
+	klog.InfoS("Updated pod service assignments", "assignments", assignments)
+}
+
+func (s *stateMemory) DeletePodServiceAssignment(podUID string) {
+	s.Lock()
+	defer s.Unlock()
+
+	delete(s.podServiceAssignments, podUID)
+	klog.V(2).InfoS("Deleted pod service assignment", "podUID", podUID)
+}
+
 func (s *stateMemory) Delete(podUID string, containerName string) {
 	s.Lock()
 	defer s.Unlock()
@@ -103,6 +219,10 @@ func (s *stateMemory) Delete(podUID string, containerName string) {
 	delete(s.assignments[podUID], containerName)
 	if len(s.assignments[podUID]) == 0 {
 		delete(s.assignments, podUID)
+	}
+	delete(s.containerAssignments[podUID], containerName)
+	if len(s.containerAssignments[podUID]) == 0 {
+		delete(s.containerAssignments, podUID)
 	}
 	klog.V(2).InfoS("Deleted CPUSet assignment", "podUID", podUID, "containerName", containerName)
 }
@@ -113,5 +233,8 @@ func (s *stateMemory) ClearState() {
 
 	s.defaultCPUSet = cpuset.CPUSet{}
 	s.assignments = make(ContainerCPUAssignments)
+	s.containerAssignments = make(ContainerAssignments)
+	s.serviceAssignments = make(ServiceCPUAssignments)
+	s.podServiceAssignments = make(PodServiceAssignments)
 	klog.V(2).InfoS("Cleared state")
 }

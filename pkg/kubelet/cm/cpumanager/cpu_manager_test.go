@@ -46,8 +46,11 @@ import (
 )
 
 type mockState struct {
-	assignments   state.ContainerCPUAssignments
-	defaultCPUSet cpuset.CPUSet
+	assignments           state.ContainerCPUAssignments
+	containerAssignments  state.ContainerAssignments
+	serviceAssignments    state.ServiceCPUAssignments
+	podServiceAssignments state.PodServiceAssignments
+	defaultCPUSet         cpuset.CPUSet
 }
 
 func (s *mockState) GetCPUSet(podUID string, containerName string) (cpuset.CPUSet, bool) {
@@ -67,6 +70,9 @@ func (s *mockState) GetCPUSetOrDefault(podUID string, containerName string) cpus
 }
 
 func (s *mockState) SetCPUSet(podUID string, containerName string, cset cpuset.CPUSet) {
+	if s.assignments == nil {
+		s.assignments = make(state.ContainerCPUAssignments)
+	}
 	if _, exists := s.assignments[podUID]; !exists {
 		s.assignments[podUID] = make(map[string]cpuset.CPUSet)
 	}
@@ -82,11 +88,18 @@ func (s *mockState) Delete(podUID string, containerName string) {
 	if len(s.assignments[podUID]) == 0 {
 		delete(s.assignments, podUID)
 	}
+	delete(s.containerAssignments[podUID], containerName)
+	if len(s.containerAssignments[podUID]) == 0 {
+		delete(s.containerAssignments, podUID)
+	}
 }
 
 func (s *mockState) ClearState() {
 	s.defaultCPUSet = cpuset.CPUSet{}
 	s.assignments = make(state.ContainerCPUAssignments)
+	s.containerAssignments = make(state.ContainerAssignments)
+	s.serviceAssignments = make(state.ServiceCPUAssignments)
+	s.podServiceAssignments = make(state.PodServiceAssignments)
 }
 
 func (s *mockState) SetCPUAssignments(a state.ContainerCPUAssignments) {
@@ -95,6 +108,77 @@ func (s *mockState) SetCPUAssignments(a state.ContainerCPUAssignments) {
 
 func (s *mockState) GetCPUAssignments() state.ContainerCPUAssignments {
 	return s.assignments.Clone()
+}
+
+func (s *mockState) GetContainerAssignment(podUID string, containerName string) (state.ContainerAssignment, bool) {
+	assignment, ok := s.containerAssignments[podUID][containerName]
+	return assignment, ok
+}
+
+func (s *mockState) GetContainerAssignments() state.ContainerAssignments {
+	return s.containerAssignments.Clone()
+}
+
+func (s *mockState) SetContainerAssignment(podUID string, containerName string, assignment state.ContainerAssignment) {
+	if s.containerAssignments == nil {
+		s.containerAssignments = make(state.ContainerAssignments)
+	}
+	if _, exists := s.containerAssignments[podUID]; !exists {
+		s.containerAssignments[podUID] = make(map[string]state.ContainerAssignment)
+	}
+	s.containerAssignments[podUID][containerName] = assignment
+}
+
+func (s *mockState) SetContainerAssignments(assignments state.ContainerAssignments) {
+	s.containerAssignments = assignments.Clone()
+}
+
+func (s *mockState) GetServiceCPUAssignment(service string) (state.ServiceCPUAssignment, bool) {
+	assignment, ok := s.serviceAssignments[service]
+	return assignment, ok
+}
+
+func (s *mockState) GetServiceCPUAssignments() state.ServiceCPUAssignments {
+	return s.serviceAssignments.Clone()
+}
+
+func (s *mockState) SetServiceCPUAssignment(service string, assignment state.ServiceCPUAssignment) {
+	if s.serviceAssignments == nil {
+		s.serviceAssignments = make(state.ServiceCPUAssignments)
+	}
+	s.serviceAssignments[service] = assignment
+}
+
+func (s *mockState) SetServiceCPUAssignments(assignments state.ServiceCPUAssignments) {
+	s.serviceAssignments = assignments.Clone()
+}
+
+func (s *mockState) DeleteServiceCPUAssignment(service string) {
+	delete(s.serviceAssignments, service)
+}
+
+func (s *mockState) GetPodServiceAssignment(podUID string) (state.PodServiceAssignment, bool) {
+	assignment, ok := s.podServiceAssignments[podUID]
+	return assignment, ok
+}
+
+func (s *mockState) GetPodServiceAssignments() state.PodServiceAssignments {
+	return s.podServiceAssignments.Clone()
+}
+
+func (s *mockState) SetPodServiceAssignment(podUID string, assignment state.PodServiceAssignment) {
+	if s.podServiceAssignments == nil {
+		s.podServiceAssignments = make(state.PodServiceAssignments)
+	}
+	s.podServiceAssignments[podUID] = assignment
+}
+
+func (s *mockState) SetPodServiceAssignments(assignments state.PodServiceAssignments) {
+	s.podServiceAssignments = assignments.Clone()
+}
+
+func (s *mockState) DeletePodServiceAssignment(podUID string) {
+	delete(s.podServiceAssignments, podUID)
 }
 
 type mockPolicy struct {
@@ -114,6 +198,10 @@ func (p *mockPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Containe
 }
 
 func (p *mockPolicy) RemoveContainer(s state.State, podUID string, containerName string) error {
+	return p.err
+}
+
+func (p *mockPolicy) ReconcileState(s state.State, activePods []*v1.Pod) error {
 	return p.err
 }
 
@@ -1509,5 +1597,35 @@ func TestCPUManagerGetAllocatableCPUs(t *testing.T) {
 			t.Errorf("Policy GetAllocatableCPUs() error (%v). expected cpuset %v for container %v but got %v",
 				testCase.description, testCase.expAllocatableCPUs, "fakeContainer", mgr.GetAllocatableCPUs())
 		}
+	}
+}
+
+func TestCPUManagerGetExclusiveCPUsSkipsServicePools(t *testing.T) {
+	mgr := &manager{
+		state: &mockState{
+			assignments: state.ContainerCPUAssignments{
+				"pod-a": {
+					"container-a": cpuset.New(1, 2),
+				},
+				"pod-b": {
+					"container-b": cpuset.New(3, 4),
+				},
+			},
+			containerAssignments: state.ContainerAssignments{
+				"pod-a": {
+					"container-a": {
+						AssignmentType: state.CPUAssignmentServicePool,
+					},
+				},
+			},
+			defaultCPUSet: cpuset.New(0, 5, 6, 7),
+		},
+	}
+
+	if got := mgr.GetExclusiveCPUs("pod-a", "container-a"); !got.IsEmpty() {
+		t.Fatalf("expected service-pooled container to report no exclusive CPUs, got %q", got)
+	}
+	if got := mgr.GetExclusiveCPUs("pod-b", "container-b"); !got.Equals(cpuset.New(3, 4)) {
+		t.Fatalf("expected exclusive allocation to remain visible, got %q", got)
 	}
 }

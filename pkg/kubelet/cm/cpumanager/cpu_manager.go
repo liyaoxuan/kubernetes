@@ -257,6 +257,11 @@ func (m *manager) Allocate(p *v1.Pod, c *v1.Container) error {
 	m.Lock()
 	defer m.Unlock()
 
+	if err := m.policy.ReconcileState(m.state, mergeActivePods(m.getActivePods(), p)); err != nil {
+		klog.ErrorS(err, "Policy reconcile error")
+		return err
+	}
+
 	// Call down into the policy to assign this container CPUs if required.
 	err := m.policy.Allocate(m.state, p, c)
 	if err != nil {
@@ -346,11 +351,49 @@ type reconciledContainer struct {
 	containerID   string
 }
 
+func mergeActivePods(activePods []*v1.Pod, extraPods ...*v1.Pod) []*v1.Pod {
+	merged := make([]*v1.Pod, 0, len(activePods)+len(extraPods))
+	seen := make(map[string]struct{}, len(activePods)+len(extraPods))
+
+	for _, pod := range activePods {
+		if pod == nil {
+			continue
+		}
+		uid := string(pod.UID)
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		merged = append(merged, pod)
+	}
+
+	for _, pod := range extraPods {
+		if pod == nil {
+			continue
+		}
+		uid := string(pod.UID)
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		merged = append(merged, pod)
+	}
+
+	return merged
+}
+
+func (m *manager) getActivePods() []*v1.Pod {
+	if m.activePods == nil {
+		return nil
+	}
+	return m.activePods()
+}
+
 func (m *manager) removeStaleState() {
 	// Only once all sources are ready do we attempt to remove any stale state.
 	// This ensures that the call to `m.activePods()` below will succeed with
 	// the actual active pods list.
-	if !m.sourcesReady.AllReady() {
+	if !m.sourcesReady.AllReady() || m.activePods == nil {
 		return
 	}
 
@@ -362,7 +405,7 @@ func (m *manager) removeStaleState() {
 	defer m.Unlock()
 
 	// Get the list of active pods.
-	activePods := m.activePods()
+	activePods := m.getActivePods()
 
 	// Build a list of (podUID, containerName) pairs for all containers in all active Pods.
 	activeContainers := make(map[string]map[string]struct{})
@@ -401,6 +444,10 @@ func (m *manager) removeStaleState() {
 			klog.ErrorS(err, "RemoveStaleState: containerMap: failed to remove container", "podUID", podUID, "containerName", containerName)
 		}
 	})
+
+	if err := m.policy.ReconcileState(m.state, activePods); err != nil {
+		klog.ErrorS(err, "RemoveStaleState: failed to reconcile CPU manager state")
+	}
 }
 
 func (m *manager) reconcileState() (success []reconciledContainer, failure []reconciledContainer) {
@@ -409,7 +456,7 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 	failure = []reconciledContainer{}
 
 	m.removeStaleState()
-	for _, pod := range m.activePods() {
+	for _, pod := range m.getActivePods() {
 		pstatus, ok := m.podStatusProvider.GetPodStatus(pod.UID)
 		if !ok {
 			klog.V(5).InfoS("ReconcileState: skipping pod; status not found", "pod", klog.KObj(pod))
@@ -514,6 +561,9 @@ func findContainerStatusByName(status *v1.PodStatus, name string) (*v1.Container
 
 func (m *manager) GetExclusiveCPUs(podUID, containerName string) cpuset.CPUSet {
 	if result, ok := m.state.GetCPUSet(podUID, containerName); ok {
+		if assignment, exists := m.state.GetContainerAssignment(podUID, containerName); exists && assignment.AssignmentType == state.CPUAssignmentServicePool {
+			return cpuset.CPUSet{}
+		}
 		return result
 	}
 

@@ -18,9 +18,11 @@ package cpumanager
 
 import (
 	"fmt"
+	"sort"
 
 	v1 "k8s.io/api/core/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	resourcehelper "k8s.io/component-helpers/resource"
 	"k8s.io/klog/v2"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
@@ -41,6 +43,10 @@ const (
 	PolicyStatic policyName = "static"
 	// ErrorSMTAlignment represents the type of an SMTAlignmentError
 	ErrorSMTAlignment = "SMTAlignmentError"
+	// ErrorServiceCPUPool represents the type of a ServiceCPUPoolError.
+	ErrorServiceCPUPool = "ServiceCPUPoolError"
+
+	servicePoolLabelKey = "service"
 )
 
 // SMTAlignmentError represents an error due to SMT alignment
@@ -61,6 +67,24 @@ func (e SMTAlignmentError) Error() string {
 // Type returns human-readable type of this error. Used in the admission control to populate Admission Failure reason.
 func (e SMTAlignmentError) Type() string {
 	return ErrorSMTAlignment
+}
+
+// ServiceCPUPoolError represents an error due to invalid or infeasible service-pool allocation.
+type ServiceCPUPoolError struct {
+	message string
+}
+
+func newServiceCPUPoolError(format string, args ...any) *ServiceCPUPoolError {
+	return &ServiceCPUPoolError{message: fmt.Sprintf(format, args...)}
+}
+
+func (e *ServiceCPUPoolError) Error() string {
+	return e.message
+}
+
+// Type returns human-readable type of this error. Used in the admission control to populate Admission Failure reason.
+func (e *ServiceCPUPoolError) Type() string {
+	return ErrorServiceCPUPool
 }
 
 // staticPolicy is a CPU manager policy that does not change CPU
@@ -200,6 +224,9 @@ func (p *staticPolicy) Start(s state.State) error {
 func (p *staticPolicy) validateState(s state.State) error {
 	tmpAssignments := s.GetCPUAssignments()
 	tmpDefaultCPUset := s.GetDefaultCPUSet()
+	tmpContainerAssignments := s.GetContainerAssignments()
+	tmpServiceAssignments := s.GetServiceCPUAssignments()
+	tmpPodServiceAssignments := s.GetPodServiceAssignments()
 
 	allCPUs := p.topology.CPUDetails.CPUs()
 	if p.options.StrictCPUReservation {
@@ -208,7 +235,7 @@ func (p *staticPolicy) validateState(s state.State) error {
 
 	// Default cpuset cannot be empty when assignments exist
 	if tmpDefaultCPUset.IsEmpty() {
-		if len(tmpAssignments) != 0 {
+		if len(tmpAssignments) != 0 || len(tmpContainerAssignments) != 0 || len(tmpServiceAssignments) != 0 || len(tmpPodServiceAssignments) != 0 {
 			return fmt.Errorf("default cpuset cannot be empty")
 		}
 		// state is empty initialize
@@ -218,6 +245,19 @@ func (p *staticPolicy) validateState(s state.State) error {
 	}
 
 	// State has already been initialized from file (is not empty)
+	if !p.servicePoolEnabled() {
+		if len(tmpServiceAssignments) > 0 || len(tmpPodServiceAssignments) > 0 {
+			return fmt.Errorf("service CPU pool state exists but %q is disabled", ServiceCPUPoolsOption)
+		}
+		for podUID, assignments := range tmpContainerAssignments {
+			for containerName, assignment := range assignments {
+				if assignment.AssignmentType == state.CPUAssignmentServicePool {
+					return fmt.Errorf("service CPU pool assignment exists for pod %q container %q but %q is disabled", podUID, containerName, ServiceCPUPoolsOption)
+				}
+			}
+		}
+	}
+
 	// 1. Check if the reserved cpuset is not part of default cpuset because:
 	// - kube/system reserved have changed (increased) - may lead to some containers not being able to start
 	// - user tampered with file
@@ -234,12 +274,29 @@ func (p *staticPolicy) validateState(s state.State) error {
 	}
 
 	// 2. Check if state for static policy is consistent
+	serviceCPUs := cpuset.New()
+	for service, assignment := range tmpServiceAssignments {
+		if !tmpDefaultCPUset.Intersection(assignment.CPUSet).IsEmpty() {
+			return fmt.Errorf("service %q cpuset %q overlaps with default cpuset %q", service, assignment.CPUSet.String(), tmpDefaultCPUset.String())
+		}
+		if !serviceCPUs.Intersection(assignment.CPUSet).IsEmpty() {
+			return fmt.Errorf("service %q cpuset %q overlaps with another service pool", service, assignment.CPUSet.String())
+		}
+		serviceCPUs = serviceCPUs.Union(assignment.CPUSet)
+	}
+
 	for pod := range tmpAssignments {
 		for container, cset := range tmpAssignments[pod] {
 			// None of the cpu in DEFAULT cset should be in s.assignments
 			if !tmpDefaultCPUset.Intersection(cset).IsEmpty() {
 				return fmt.Errorf("pod: %s, container: %s cpuset: \"%s\" overlaps with default cpuset \"%s\"",
 					pod, container, cset.String(), tmpDefaultCPUset.String())
+			}
+			if !serviceCPUs.Intersection(cset).IsEmpty() {
+				assignment, ok := tmpContainerAssignments[pod][container]
+				if !ok || assignment.AssignmentType != state.CPUAssignmentServicePool {
+					return fmt.Errorf("pod: %s, container: %s cpuset: \"%s\" overlaps with service cpuset", pod, container, cset.String())
+				}
 			}
 		}
 	}
@@ -257,6 +314,9 @@ func (p *staticPolicy) validateState(s state.State) error {
 		for _, cset := range tmpAssignments[pod] {
 			tmpCPUSets = append(tmpCPUSets, cset)
 		}
+	}
+	for _, assignment := range tmpServiceAssignments {
+		tmpCPUSets = append(tmpCPUSets, assignment.CPUSet)
 	}
 	totalKnownCPUs = totalKnownCPUs.Union(tmpCPUSets...)
 	if !totalKnownCPUs.Equals(allCPUs) {
@@ -312,7 +372,248 @@ func (p *staticPolicy) updateCPUsToReuse(pod *v1.Pod, container *v1.Container, c
 	p.cpusToReuse[string(pod.UID)] = p.cpusToReuse[string(pod.UID)].Difference(cset)
 }
 
+func (p *staticPolicy) servicePoolEnabled() bool {
+	return p.options.ServiceCPUPools
+}
+
+func (p *staticPolicy) serviceLabelForPod(pod *v1.Pod) (string, bool) {
+	if pod == nil || pod.Labels == nil {
+		return "", false
+	}
+	service, ok := pod.Labels[servicePoolLabelKey]
+	if !ok {
+		return "", false
+	}
+	return service, true
+}
+
+func (p *staticPolicy) podServiceAssignment(pod *v1.Pod) (state.PodServiceAssignment, bool, error) {
+	if !p.servicePoolEnabled() {
+		return state.PodServiceAssignment{}, false, nil
+	}
+
+	service, hasServiceLabel := p.serviceLabelForPod(pod)
+	if !hasServiceLabel {
+		return state.PodServiceAssignment{}, false, nil
+	}
+	if service == "" {
+		return state.PodServiceAssignment{}, false, newServiceCPUPoolError("pod %s has an empty %q label", klog.KObj(pod), servicePoolLabelKey)
+	}
+	if v1qos.GetPodQOS(pod) != v1.PodQOSGuaranteed {
+		return state.PodServiceAssignment{}, false, newServiceCPUPoolError("pod %s must be Guaranteed to use service CPU pools", klog.KObj(pod))
+	}
+
+	requestedCPUs, err := p.effectivePodCPURequestForServicePool(pod)
+	if err != nil {
+		return state.PodServiceAssignment{}, false, err
+	}
+	if requestedCPUs <= 0 {
+		return state.PodServiceAssignment{}, false, newServiceCPUPoolError("pod %s must request a positive integer number of CPUs to use service CPU pools", klog.KObj(pod))
+	}
+
+	return state.PodServiceAssignment{
+		Service:       service,
+		RequestedCPUs: requestedCPUs,
+	}, true, nil
+}
+
+func (p *staticPolicy) effectivePodCPURequestForServicePool(pod *v1.Pod) (int, error) {
+	requests := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{
+		SkipPodLevelResources: !utilfeature.DefaultFeatureGate.Enabled(features.PodLevelResources),
+		UseStatusResources:    utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling),
+	})
+	cpuQuantity, ok := requests[v1.ResourceCPU]
+	if !ok || cpuQuantity.IsZero() {
+		return 0, newServiceCPUPoolError("pod %s is missing a CPU request for service CPU pooling", klog.KObj(pod))
+	}
+	if cpuQuantity.Value()*1000 != cpuQuantity.MilliValue() {
+		return 0, newServiceCPUPoolError("pod %s requested a non-integral CPU quantity %q for service CPU pooling", klog.KObj(pod), cpuQuantity.String())
+	}
+	return int(cpuQuantity.Value()), nil
+}
+
+func (p *staticPolicy) servicePoolHints(s state.State, pod *v1.Pod, desired state.PodServiceAssignment) []topologymanager.TopologyHint {
+	requested := desired.RequestedCPUs
+	available := p.GetAvailableCPUs(s)
+	reusable := cpuset.New()
+
+	if currentPool, ok := s.GetServiceCPUAssignment(desired.Service); ok {
+		available = available.Union(currentPool.CPUSet)
+		reusable = currentPool.CPUSet
+
+		existingContribution := 0
+		if currentPod, ok := s.GetPodServiceAssignment(string(pod.UID)); ok && currentPod.Service == desired.Service {
+			existingContribution = currentPod.RequestedCPUs
+		}
+		requested = currentPool.RequestedCPUs - existingContribution + desired.RequestedCPUs
+	}
+
+	return p.generateCPUTopologyHints(available, reusable, requested)
+}
+
+func (p *staticPolicy) allocateServicePool(s state.State, requestedCPUs int, existing cpuset.CPUSet) (cpuset.CPUSet, error) {
+	pool := cpuset.New()
+
+	if requestedCPUs <= 0 {
+		return pool, nil
+	}
+
+	if !existing.IsEmpty() {
+		if existing.Size() > requestedCPUs {
+			kept, err := p.takeByTopology(existing, requestedCPUs)
+			if err != nil {
+				return cpuset.New(), err
+			}
+			s.SetDefaultCPUSet(s.GetDefaultCPUSet().Difference(kept))
+			return kept, nil
+		}
+
+		pool = existing.Clone()
+		s.SetDefaultCPUSet(s.GetDefaultCPUSet().Difference(existing))
+		if existing.Size() == requestedCPUs {
+			return pool, nil
+		}
+	}
+
+	extra, err := p.allocateCPUs(s, requestedCPUs-pool.Size(), nil, cpuset.New())
+	if err != nil {
+		return cpuset.New(), err
+	}
+	return pool.Union(extra), nil
+}
+
+func (p *staticPolicy) releaseServicePools(s state.State) {
+	defaultCPUSet := s.GetDefaultCPUSet()
+	for _, assignment := range s.GetServiceCPUAssignments() {
+		defaultCPUSet = defaultCPUSet.Union(assignment.CPUSet)
+	}
+
+	for podUID, assignments := range s.GetContainerAssignments() {
+		for containerName, assignment := range assignments {
+			if assignment.AssignmentType == state.CPUAssignmentServicePool {
+				if cset, ok := s.GetCPUSet(podUID, containerName); ok {
+					defaultCPUSet = defaultCPUSet.Union(cset)
+				}
+				s.Delete(podUID, containerName)
+			}
+		}
+	}
+	s.SetDefaultCPUSet(defaultCPUSet)
+	for podUID := range s.GetPodServiceAssignments() {
+		s.DeletePodServiceAssignment(podUID)
+	}
+	s.SetServiceCPUAssignments(state.ServiceCPUAssignments{})
+}
+
+func (p *staticPolicy) ReconcileState(s state.State, activePods []*v1.Pod) error {
+	if !p.servicePoolEnabled() {
+		return nil
+	}
+
+	currentServiceAssignments := s.GetServiceCPUAssignments()
+	currentPodAssignments := s.GetPodServiceAssignments()
+
+	scratch := state.NewMemoryState()
+	scratch.SetDefaultCPUSet(s.GetDefaultCPUSet())
+	scratch.SetCPUAssignments(s.GetCPUAssignments())
+	scratch.SetContainerAssignments(s.GetContainerAssignments())
+	scratch.SetServiceCPUAssignments(currentServiceAssignments)
+	scratch.SetPodServiceAssignments(currentPodAssignments)
+
+	p.releaseServicePools(scratch)
+
+	desiredPodAssignments := state.PodServiceAssignments{}
+	desiredServiceAssignments := state.ServiceCPUAssignments{}
+	serviceMembers := make(map[string][]*v1.Pod)
+	serviceTotals := make(map[string]int)
+
+	for _, pod := range activePods {
+		desired, shouldPool, err := p.podServiceAssignment(pod)
+		if err != nil {
+			if _, wasPooled := currentPodAssignments[string(pod.UID)]; wasPooled {
+				return err
+			}
+			return err
+		}
+		if !shouldPool {
+			if _, wasPooled := currentPodAssignments[string(pod.UID)]; wasPooled {
+				return newServiceCPUPoolError("pod %s no longer qualifies for service CPU pooling while running", klog.KObj(pod))
+			}
+			continue
+		}
+
+		desiredPodAssignments[string(pod.UID)] = desired
+		serviceMembers[desired.Service] = append(serviceMembers[desired.Service], pod)
+		serviceTotals[desired.Service] += desired.RequestedCPUs
+	}
+
+	services := make([]string, 0, len(serviceTotals))
+	for service := range serviceTotals {
+		services = append(services, service)
+	}
+	sort.Strings(services)
+
+	for _, service := range services {
+		existing := cpuset.New()
+		if current, ok := currentServiceAssignments[service]; ok {
+			existing = current.CPUSet
+		}
+		pool, err := p.allocateServicePool(scratch, serviceTotals[service], existing)
+		if err != nil {
+			return newServiceCPUPoolError("unable to allocate CPUs for service %q: %v", service, err)
+		}
+		desiredServiceAssignments[service] = state.ServiceCPUAssignment{
+			CPUSet:        pool,
+			RequestedCPUs: serviceTotals[service],
+		}
+
+		for _, pod := range serviceMembers[service] {
+			podUID := string(pod.UID)
+			scratch.SetPodServiceAssignment(podUID, desiredPodAssignments[podUID])
+			for _, container := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+				scratch.SetCPUSet(podUID, container.Name, pool)
+				scratch.SetContainerAssignment(podUID, container.Name, state.ContainerAssignment{
+					AssignmentType: state.CPUAssignmentServicePool,
+				})
+			}
+		}
+	}
+
+	s.SetDefaultCPUSet(scratch.GetDefaultCPUSet())
+	s.SetCPUAssignments(scratch.GetCPUAssignments())
+	s.SetContainerAssignments(scratch.GetContainerAssignments())
+	s.SetServiceCPUAssignments(desiredServiceAssignments)
+	s.SetPodServiceAssignments(desiredPodAssignments)
+
+	metrics.CPUManagerSharedPoolSizeMilliCores.Set(float64(p.GetAvailableCPUs(s).Size() * 1000))
+	metrics.CPUManagerExclusiveCPUsAllocationCount.Set(float64(countExclusiveCPUs(s)))
+	return nil
+}
+
 func (p *staticPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Container) (rerr error) {
+	if desired, shouldPool, err := p.podServiceAssignment(pod); err != nil {
+		return err
+	} else if shouldPool {
+		if _, ok := s.GetServiceCPUAssignment(desired.Service); !ok {
+			if err := p.ReconcileState(s, []*v1.Pod{pod}); err != nil {
+				return err
+			}
+		}
+		current, ok := s.GetServiceCPUAssignment(desired.Service)
+		if !ok {
+			return newServiceCPUPoolError("service pool for service %q not available for pod %s", desired.Service, klog.KObj(pod))
+		}
+		podUID := string(pod.UID)
+		s.SetPodServiceAssignment(podUID, desired)
+		for _, currentContainer := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+			s.SetCPUSet(podUID, currentContainer.Name, current.CPUSet)
+			s.SetContainerAssignment(podUID, currentContainer.Name, state.ContainerAssignment{
+				AssignmentType: state.CPUAssignmentServicePool,
+			})
+		}
+		return nil
+	}
+
 	numCPUs := p.guaranteedCPUs(pod, container)
 	if numCPUs == 0 {
 		// container belongs in the shared pool (nothing to do; use default cpuset)
@@ -406,6 +707,10 @@ func getAssignedCPUsOfSiblings(s state.State, podUID string, containerName strin
 
 func (p *staticPolicy) RemoveContainer(s state.State, podUID string, containerName string) error {
 	klog.InfoS("Static policy: RemoveContainer", "podUID", podUID, "containerName", containerName)
+	if assignment, ok := s.GetContainerAssignment(podUID, containerName); ok && assignment.AssignmentType == state.CPUAssignmentServicePool {
+		klog.V(4).InfoS("Static policy: skipping direct release for service-pooled container", "podUID", podUID, "containerName", containerName)
+		return nil
+	}
 	cpusInUse := getAssignedCPUsOfSiblings(s, podUID, containerName)
 	if toRelease, ok := s.GetCPUSet(podUID, containerName); ok {
 		s.Delete(podUID, containerName)
@@ -529,6 +834,12 @@ func (p *staticPolicy) takeByTopology(availableCPUs cpuset.CPUSet, numCPUs int) 
 }
 
 func (p *staticPolicy) GetTopologyHints(s state.State, pod *v1.Pod, container *v1.Container) map[string][]topologymanager.TopologyHint {
+	if _, shouldPool, err := p.podServiceAssignment(pod); err != nil || shouldPool {
+		return map[string][]topologymanager.TopologyHint{
+			string(v1.ResourceCPU): {},
+		}
+	}
+
 	// Get a count of how many guaranteed CPUs have been requested.
 	requested := p.guaranteedCPUs(pod, container)
 
@@ -576,6 +887,16 @@ func (p *staticPolicy) GetTopologyHints(s state.State, pod *v1.Pod, container *v
 }
 
 func (p *staticPolicy) GetPodTopologyHints(s state.State, pod *v1.Pod) map[string][]topologymanager.TopologyHint {
+	if desired, shouldPool, err := p.podServiceAssignment(pod); err != nil {
+		return map[string][]topologymanager.TopologyHint{
+			string(v1.ResourceCPU): {},
+		}
+	} else if shouldPool {
+		return map[string][]topologymanager.TopologyHint{
+			string(v1.ResourceCPU): p.servicePoolHints(s, pod, desired),
+		}
+	}
+
 	// Get a count of how many guaranteed CPUs have been requested by Pod.
 	requested := p.podGuaranteedCPUs(pod)
 
@@ -757,8 +1078,11 @@ func (p *staticPolicy) updateMetricsOnRelease(cset cpuset.CPUSet) {
 
 func countExclusiveCPUs(s state.State) int {
 	exclusiveCPUs := 0
-	for _, cpuAssign := range s.GetCPUAssignments() {
-		for _, cset := range cpuAssign {
+	for podUID, cpuAssign := range s.GetCPUAssignments() {
+		for containerName, cset := range cpuAssign {
+			if assignment, ok := s.GetContainerAssignment(podUID, containerName); ok && assignment.AssignmentType == state.CPUAssignmentServicePool {
+				continue
+			}
 			exclusiveCPUs += cset.Size()
 		}
 	}

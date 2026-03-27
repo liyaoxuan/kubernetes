@@ -30,15 +30,8 @@ import (
 
 var _ checkpointmanager.Checkpoint = &CPUManagerCheckpointV1{}
 var _ checkpointmanager.Checkpoint = &CPUManagerCheckpointV2{}
+var _ checkpointmanager.Checkpoint = &CPUManagerCheckpointV3{}
 var _ checkpointmanager.Checkpoint = &CPUManagerCheckpoint{}
-
-// CPUManagerCheckpoint struct is used to store cpu/pod assignments in a checkpoint in v2 format
-type CPUManagerCheckpoint struct {
-	PolicyName    string                       `json:"policyName"`
-	DefaultCPUSet string                       `json:"defaultCpuSet"`
-	Entries       map[string]map[string]string `json:"entries,omitempty"`
-	Checksum      checksum.Checksum            `json:"checksum"`
-}
 
 // CPUManagerCheckpointV1 struct is used to store cpu/pod assignments in a checkpoint in v1 format
 type CPUManagerCheckpointV1 struct {
@@ -49,12 +42,30 @@ type CPUManagerCheckpointV1 struct {
 }
 
 // CPUManagerCheckpointV2 struct is used to store cpu/pod assignments in a checkpoint in v2 format
-type CPUManagerCheckpointV2 = CPUManagerCheckpoint
+type CPUManagerCheckpointV2 struct {
+	PolicyName    string                       `json:"policyName"`
+	DefaultCPUSet string                       `json:"defaultCpuSet"`
+	Entries       map[string]map[string]string `json:"entries,omitempty"`
+	Checksum      checksum.Checksum            `json:"checksum"`
+}
+
+// CPUManagerCheckpointV3 struct is used to store cpu manager state in a checkpoint in v3 format.
+type CPUManagerCheckpointV3 struct {
+	PolicyName        string                       `json:"policyName"`
+	DefaultCPUSet     string                       `json:"defaultCpuSet"`
+	Entries           map[string]map[string]string `json:"entries,omitempty"`
+	ContainerEntries  ContainerAssignments         `json:"containerEntries,omitempty"`
+	ServiceEntries    ServiceCPUAssignments        `json:"serviceEntries,omitempty"`
+	PodServiceEntries PodServiceAssignments        `json:"podServiceEntries,omitempty"`
+	Checksum          checksum.Checksum            `json:"checksum"`
+}
+
+// CPUManagerCheckpoint stores cpu manager state in the latest checkpoint format.
+type CPUManagerCheckpoint = CPUManagerCheckpointV3
 
 // NewCPUManagerCheckpoint returns an instance of Checkpoint
 func NewCPUManagerCheckpoint() *CPUManagerCheckpoint {
-	//nolint:staticcheck // unexported-type-in-api user-facing error message
-	return newCPUManagerCheckpointV2()
+	return newCPUManagerCheckpointV3()
 }
 
 func newCPUManagerCheckpointV1() *CPUManagerCheckpointV1 {
@@ -66,6 +77,15 @@ func newCPUManagerCheckpointV1() *CPUManagerCheckpointV1 {
 func newCPUManagerCheckpointV2() *CPUManagerCheckpointV2 {
 	return &CPUManagerCheckpointV2{
 		Entries: make(map[string]map[string]string),
+	}
+}
+
+func newCPUManagerCheckpointV3() *CPUManagerCheckpointV3 {
+	return &CPUManagerCheckpointV3{
+		Entries:           make(map[string]map[string]string),
+		ContainerEntries:  make(ContainerAssignments),
+		ServiceEntries:    make(ServiceCPUAssignments),
+		PodServiceEntries: make(PodServiceAssignments),
 	}
 }
 
@@ -85,6 +105,14 @@ func (cp *CPUManagerCheckpointV2) MarshalCheckpoint() ([]byte, error) {
 	return json.Marshal(*cp)
 }
 
+// MarshalCheckpoint returns marshalled checkpoint in v3 format
+func (cp *CPUManagerCheckpointV3) MarshalCheckpoint() ([]byte, error) {
+	// make sure checksum wasn't set before so it doesn't affect output checksum
+	cp.Checksum = 0
+	cp.Checksum = checksum.New(cp)
+	return json.Marshal(*cp)
+}
+
 // UnmarshalCheckpoint tries to unmarshal passed bytes to checkpoint in v1 format
 func (cp *CPUManagerCheckpointV1) UnmarshalCheckpoint(blob []byte) error {
 	return json.Unmarshal(blob, cp)
@@ -92,6 +120,11 @@ func (cp *CPUManagerCheckpointV1) UnmarshalCheckpoint(blob []byte) error {
 
 // UnmarshalCheckpoint tries to unmarshal passed bytes to checkpoint in v2 format
 func (cp *CPUManagerCheckpointV2) UnmarshalCheckpoint(blob []byte) error {
+	return json.Unmarshal(blob, cp)
+}
+
+// UnmarshalCheckpoint tries to unmarshal passed bytes to checkpoint in v3 format
+func (cp *CPUManagerCheckpointV3) UnmarshalCheckpoint(blob []byte) error {
 	return json.Unmarshal(blob, cp)
 }
 
@@ -125,6 +158,18 @@ func (cp *CPUManagerCheckpointV1) VerifyChecksum() error {
 func (cp *CPUManagerCheckpointV2) VerifyChecksum() error {
 	if cp.Checksum == 0 {
 		// accept empty checksum for compatibility with old file backend
+		return nil
+	}
+	ck := cp.Checksum
+	cp.Checksum = 0
+	err := ck.Verify(cp)
+	cp.Checksum = ck
+	return err
+}
+
+// VerifyChecksum verifies that current checksum of checkpoint is valid in v3 format
+func (cp *CPUManagerCheckpointV3) VerifyChecksum() error {
+	if cp.Checksum == 0 {
 		return nil
 	}
 	ck := cp.Checksum

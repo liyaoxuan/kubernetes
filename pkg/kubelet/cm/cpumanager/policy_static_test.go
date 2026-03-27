@@ -1147,6 +1147,152 @@ func TestStaticPolicyAddWithResvList(t *testing.T) {
 	}
 }
 
+func TestStaticPolicyReconcileStateServicePools(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
+
+	p, err := NewStaticPolicy(topoSingleSocketHT, 1, cpuset.New(), topologymanager.NewFakeManager(), map[string]string{
+		ServiceCPUPoolsOption: "true",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating static policy: %v", err)
+	}
+	policy := p.(*staticPolicy)
+
+	st := &mockState{
+		assignments:           state.ContainerCPUAssignments{},
+		containerAssignments:  state.ContainerAssignments{},
+		serviceAssignments:    state.ServiceCPUAssignments{},
+		podServiceAssignments: state.PodServiceAssignments{},
+	}
+	if err := policy.Start(st); err != nil {
+		t.Fatalf("unexpected error starting static policy: %v", err)
+	}
+
+	podA1 := makeMultiContainerPod(nil, []struct{ request, limit string }{
+		{request: "500m", limit: "500m"},
+		{request: "500m", limit: "500m"},
+	})
+	podA1.Name = "pod-a1"
+	podA1.UID = "pod-a1"
+	podA1.Labels = map[string]string{servicePoolLabelKey: "service-a"}
+
+	podA2 := makePod("pod-a2", "container-a2", "1000m", "1000m")
+	podA2.Name = "pod-a2"
+	podA2.Labels = map[string]string{servicePoolLabelKey: "service-a"}
+
+	podB1 := makePod("pod-b1", "container-b1", "2000m", "2000m")
+	podB1.Name = "pod-b1"
+	podB1.Labels = map[string]string{servicePoolLabelKey: "service-b"}
+
+	if err := policy.ReconcileState(st, []*v1.Pod{podB1, podA2, podA1}); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	serviceA, ok := st.GetServiceCPUAssignment("service-a")
+	if !ok {
+		t.Fatal("expected service-a pool to exist")
+	}
+	serviceB, ok := st.GetServiceCPUAssignment("service-b")
+	if !ok {
+		t.Fatal("expected service-b pool to exist")
+	}
+
+	if serviceA.RequestedCPUs != 2 || serviceA.CPUSet.Size() != 2 {
+		t.Fatalf("unexpected service-a pool: %+v", serviceA)
+	}
+	if serviceB.RequestedCPUs != 2 || serviceB.CPUSet.Size() != 2 {
+		t.Fatalf("unexpected service-b pool: %+v", serviceB)
+	}
+	if !serviceA.CPUSet.Intersection(serviceB.CPUSet).IsEmpty() {
+		t.Fatalf("expected service pools to be disjoint, got %q and %q", serviceA.CPUSet, serviceB.CPUSet)
+	}
+
+	for _, container := range append(podA1.Spec.InitContainers, podA1.Spec.Containers...) {
+		cset, ok := st.GetCPUSet(string(podA1.UID), container.Name)
+		if !ok || !cset.Equals(serviceA.CPUSet) {
+			t.Fatalf("expected podA1 container %q to use service-a pool %q, got %q", container.Name, serviceA.CPUSet, cset)
+		}
+		assignment, ok := st.GetContainerAssignment(string(podA1.UID), container.Name)
+		if !ok || assignment.AssignmentType != state.CPUAssignmentServicePool {
+			t.Fatalf("expected podA1 container %q to be marked as service pooled, got %+v", container.Name, assignment)
+		}
+	}
+
+	csetA2, ok := st.GetCPUSet(string(podA2.UID), podA2.Spec.Containers[0].Name)
+	if !ok || !csetA2.Equals(serviceA.CPUSet) {
+		t.Fatalf("expected podA2 to use service-a pool %q, got %q", serviceA.CPUSet, csetA2)
+	}
+	csetB1, ok := st.GetCPUSet(string(podB1.UID), podB1.Spec.Containers[0].Name)
+	if !ok || !csetB1.Equals(serviceB.CPUSet) {
+		t.Fatalf("expected podB1 to use service-b pool %q, got %q", serviceB.CPUSet, csetB1)
+	}
+
+	if available := policy.GetAvailableCPUs(st).Size(); available != 3 {
+		t.Fatalf("expected 3 allocatable CPUs to remain after pooling, got %d", available)
+	}
+
+	if err := policy.ReconcileState(st, []*v1.Pod{podA1, podB1}); err != nil {
+		t.Fatalf("unexpected reconcile error on shrink: %v", err)
+	}
+
+	serviceA, ok = st.GetServiceCPUAssignment("service-a")
+	if !ok || serviceA.RequestedCPUs != 1 || serviceA.CPUSet.Size() != 1 {
+		t.Fatalf("unexpected service-a pool after shrink: %+v", serviceA)
+	}
+	serviceB, ok = st.GetServiceCPUAssignment("service-b")
+	if !ok || serviceB.RequestedCPUs != 2 || serviceB.CPUSet.Size() != 2 {
+		t.Fatalf("unexpected service-b pool after shrink: %+v", serviceB)
+	}
+	if !serviceA.CPUSet.Intersection(serviceB.CPUSet).IsEmpty() {
+		t.Fatalf("expected service pools to remain disjoint after shrink, got %q and %q", serviceA.CPUSet, serviceB.CPUSet)
+	}
+	if available := policy.GetAvailableCPUs(st).Size(); available != 4 {
+		t.Fatalf("expected 4 allocatable CPUs to remain after shrink, got %d", available)
+	}
+}
+
+func TestStaticPolicyRemoveContainerServicePoolNoop(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
+
+	p, err := NewStaticPolicy(topoSingleSocketHT, 1, cpuset.New(), topologymanager.NewFakeManager(), map[string]string{
+		ServiceCPUPoolsOption: "true",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating static policy: %v", err)
+	}
+	policy := p.(*staticPolicy)
+
+	st := &mockState{
+		assignments:           state.ContainerCPUAssignments{},
+		containerAssignments:  state.ContainerAssignments{},
+		serviceAssignments:    state.ServiceCPUAssignments{},
+		podServiceAssignments: state.PodServiceAssignments{},
+	}
+	if err := policy.Start(st); err != nil {
+		t.Fatalf("unexpected error starting static policy: %v", err)
+	}
+
+	pod := makePod("pod-a", "container-a", "1000m", "1000m")
+	pod.Name = "pod-a"
+	pod.Labels = map[string]string{servicePoolLabelKey: "service-a"}
+
+	if err := policy.ReconcileState(st, []*v1.Pod{pod}); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	before := st.GetDefaultCPUSet()
+	if err := policy.RemoveContainer(st, string(pod.UID), pod.Spec.Containers[0].Name); err != nil {
+		t.Fatalf("unexpected remove error: %v", err)
+	}
+
+	if _, ok := st.GetCPUSet(string(pod.UID), pod.Spec.Containers[0].Name); !ok {
+		t.Fatal("expected service-pooled container assignment to be preserved until reconcile")
+	}
+	if !st.GetDefaultCPUSet().Equals(before) {
+		t.Fatalf("expected shared pool to remain unchanged, got %q want %q", st.GetDefaultCPUSet(), before)
+	}
+}
+
 type staticPolicyOptionTestCase struct {
 	description   string
 	policyOptions map[string]string
