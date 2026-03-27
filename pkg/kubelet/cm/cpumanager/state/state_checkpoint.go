@@ -96,15 +96,16 @@ func (sc *stateCheckpoint) loadCheckpointV3() (*CPUManagerCheckpointV3, error) {
 }
 
 func (sc *stateCheckpoint) loadAndMigrateCheckpointV2() (*CPUManagerCheckpointV2, error) {
-	checkpointV2 := newCPUManagerCheckpointV2()
-	err := sc.checkpointManager.GetCheckpoint(sc.checkpointName, checkpointV2)
-	if err == nil {
-		return checkpointV2, nil
-	}
-
 	checkpointV1 := newCPUManagerCheckpointV1()
-	if err = sc.checkpointManager.GetCheckpoint(sc.checkpointName, checkpointV1); err != nil {
-		return nil, err
+	checkpointV2 := newCPUManagerCheckpointV2()
+
+	err := sc.checkpointManager.GetCheckpoint(sc.checkpointName, checkpointV1)
+	if err != nil {
+		checkpointV1 = &CPUManagerCheckpointV1{}
+		checkpointV2 = newCPUManagerCheckpointV2()
+		if err = sc.checkpointManager.GetCheckpoint(sc.checkpointName, checkpointV2); err != nil {
+			return nil, err
+		}
 	}
 
 	if err = sc.migrateV1CheckpointToV2Checkpoint(checkpointV1, checkpointV2); err != nil {

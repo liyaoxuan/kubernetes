@@ -89,6 +89,23 @@ func newCPUManagerCheckpointV3() *CPUManagerCheckpointV3 {
 	}
 }
 
+func verifyCheckpointChecksumWithTypeRewrite(cp any, checksumValue checksum.Checksum, fromTypeName, toTypeName string) error {
+	object := dump.ForHash(cp)
+	object = strings.Replace(object, fromTypeName, toTypeName, 1)
+
+	hash := fnv.New32a()
+	fmt.Fprintf(hash, "%v", object)
+	actualCS := checksum.Checksum(hash.Sum32())
+	if checksumValue != actualCS {
+		return &errors.CorruptCheckpointError{
+			ActualCS:   uint64(actualCS),
+			ExpectedCS: uint64(checksumValue),
+		}
+	}
+
+	return nil
+}
+
 // MarshalCheckpoint returns marshalled checkpoint in v1 format
 func (cp *CPUManagerCheckpointV1) MarshalCheckpoint() ([]byte, error) {
 	// make sure checksum wasn't set before so it doesn't affect output checksum
@@ -101,7 +118,11 @@ func (cp *CPUManagerCheckpointV1) MarshalCheckpoint() ([]byte, error) {
 func (cp *CPUManagerCheckpointV2) MarshalCheckpoint() ([]byte, error) {
 	// make sure checksum wasn't set before so it doesn't affect output checksum
 	cp.Checksum = 0
-	cp.Checksum = checksum.New(cp)
+	object := dump.ForHash(cp)
+	object = strings.Replace(object, "CPUManagerCheckpointV2", "CPUManagerCheckpoint", 1)
+	hash := fnv.New32a()
+	fmt.Fprintf(hash, "%v", object)
+	cp.Checksum = checksum.Checksum(hash.Sum32())
 	return json.Marshal(*cp)
 }
 
@@ -162,7 +183,7 @@ func (cp *CPUManagerCheckpointV2) VerifyChecksum() error {
 	}
 	ck := cp.Checksum
 	cp.Checksum = 0
-	err := ck.Verify(cp)
+	err := verifyCheckpointChecksumWithTypeRewrite(cp, ck, "CPUManagerCheckpointV2", "CPUManagerCheckpoint")
 	cp.Checksum = ck
 	return err
 }
