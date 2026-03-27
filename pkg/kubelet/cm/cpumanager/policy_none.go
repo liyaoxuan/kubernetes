@@ -59,6 +59,10 @@ func (p *nonePolicy) RemoveContainer(_ logr.Logger, s state.State, podUID string
 	return nil
 }
 
+func (p *nonePolicy) ReconcileState(_ logr.Logger, s state.State, activePods []*v1.Pod) error {
+	return nil
+}
+
 func (p *nonePolicy) GetTopologyHints(_ logr.Logger, s state.State, pod *v1.Pod, container *v1.Container) map[string][]topologymanager.TopologyHint {
 	return nil
 }

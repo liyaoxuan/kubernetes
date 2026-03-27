@@ -459,6 +459,34 @@ func TestCheckpointStateStore(t *testing.T) {
 				},
 			},
 		},
+		{
+			"Store service pool metadata",
+			&stateMemory{
+				assignments: ContainerCPUAssignments{
+					"pod": {
+						"container1": cpuset.New(2, 3),
+					},
+				},
+				containerAssignments: ContainerAssignments{
+					"pod": {
+						"container1": {AssignmentType: CPUAssignmentServicePool},
+					},
+				},
+				serviceAssignments: ServiceCPUAssignments{
+					"svc-a": {
+						CPUSet:        cpuset.New(2, 3),
+						RequestedCPUs: 2,
+					},
+				},
+				podServiceAssignments: PodServiceAssignments{
+					"pod": {
+						Service:       "svc-a",
+						RequestedCPUs: 2,
+					},
+				},
+				defaultCPUSet: cpuset.New(0, 1, 4, 5),
+			},
+		},
 	}
 
 	// create temp dir
@@ -487,6 +515,9 @@ func TestCheckpointStateStore(t *testing.T) {
 			// set values of cs1 instance so they are stored in checkpoint and can be read by cs2
 			cs1.SetDefaultCPUSet(tc.expectedState.defaultCPUSet)
 			cs1.SetCPUAssignments(tc.expectedState.assignments)
+			cs1.SetContainerAssignments(tc.expectedState.containerAssignments)
+			cs1.SetServiceCPUAssignments(tc.expectedState.serviceAssignments)
+			cs1.SetPodServiceAssignments(tc.expectedState.podServiceAssignments)
 
 			// restore checkpoint with previously stored values
 			cs2, err := NewCheckpointState(logger, testingDir, testingCheckpoint, "none", nil)
@@ -637,6 +668,22 @@ func AssertStateEqual(t *testing.T, sf State, sm State) {
 	cpuassignmentSm := sm.GetCPUAssignments()
 	if !reflect.DeepEqual(cpuassignmentSf, cpuassignmentSm) {
 		t.Errorf("State CPU assignments mismatch. Have %s, want %s", cpuassignmentSf, cpuassignmentSm)
+	}
+
+	if sfAssignments, smAssignments := sf.GetPodCPUAssignments(), sm.GetPodCPUAssignments(); len(sfAssignments) != len(smAssignments) || !reflect.DeepEqual(sfAssignments, smAssignments) {
+		t.Errorf("State pod CPU assignments mismatch. Have %v, want %v", sfAssignments, smAssignments)
+	}
+
+	if sfAssignments, smAssignments := sf.GetContainerAssignments(), sm.GetContainerAssignments(); len(sfAssignments) != len(smAssignments) || !reflect.DeepEqual(sfAssignments, smAssignments) {
+		t.Errorf("State container assignment metadata mismatch. Have %v, want %v", sfAssignments, smAssignments)
+	}
+
+	if sfAssignments, smAssignments := sf.GetServiceCPUAssignments(), sm.GetServiceCPUAssignments(); len(sfAssignments) != len(smAssignments) || !reflect.DeepEqual(sfAssignments, smAssignments) {
+		t.Errorf("State service CPU assignments mismatch. Have %v, want %v", sfAssignments, smAssignments)
+	}
+
+	if sfAssignments, smAssignments := sf.GetPodServiceAssignments(), sm.GetPodServiceAssignments(); len(sfAssignments) != len(smAssignments) || !reflect.DeepEqual(sfAssignments, smAssignments) {
+		t.Errorf("State pod service assignments mismatch. Have %v, want %v", sfAssignments, smAssignments)
 	}
 }
 

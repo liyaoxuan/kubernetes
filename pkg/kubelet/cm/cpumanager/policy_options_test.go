@@ -106,6 +106,18 @@ func TestPolicyOptionsAvailable(t *testing.T) {
 			featureGateEnable: true,
 			expectedAvailable: false,
 		},
+		{
+			option:            ServiceCPUPoolsOption,
+			featureGate:       pkgfeatures.CPUManagerPolicyAlphaOptions,
+			featureGateEnable: true,
+			expectedAvailable: true,
+		},
+		{
+			option:            ServiceCPUPoolsOption,
+			featureGate:       pkgfeatures.CPUManagerPolicyAlphaOptions,
+			featureGateEnable: false,
+			expectedAvailable: false,
+		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.option, func(t *testing.T) {
@@ -144,6 +156,7 @@ func TestValidateStaticPolicyOptions(t *testing.T) {
 		policyOption  map[string]string
 		topology      *topology.CPUTopology
 		topoMgrPolicy string
+		topoMgrScope  string
 		expectedErr   bool
 	}{
 		{
@@ -151,6 +164,7 @@ func TestValidateStaticPolicyOptions(t *testing.T) {
 			policyOption:  map[string]string{FullPCPUsOnlyOption: "true"},
 			topology:      topoDualSocketMultiNumaPerSocketHT,
 			topoMgrPolicy: topologymanager.PolicySingleNumaNode,
+			topoMgrScope:  topologymanager.NoneTopologyScope,
 			expectedErr:   false,
 		},
 		{
@@ -158,6 +172,7 @@ func TestValidateStaticPolicyOptions(t *testing.T) {
 			policyOption:  map[string]string{AlignBySocketOption: "true"},
 			topology:      topoDualSocketMultiNumaPerSocketHT,
 			topoMgrPolicy: topologymanager.PolicySingleNumaNode,
+			topoMgrScope:  topologymanager.NoneTopologyScope,
 			expectedErr:   true,
 		},
 		{
@@ -165,6 +180,7 @@ func TestValidateStaticPolicyOptions(t *testing.T) {
 			policyOption:  map[string]string{AlignBySocketOption: "true"},
 			topology:      fakeTopoMultiSocketDualSocketPerNumaHT,
 			topoMgrPolicy: topologymanager.PolicyNone,
+			topoMgrScope:  topologymanager.NoneTopologyScope,
 			expectedErr:   true,
 		},
 		{
@@ -172,6 +188,7 @@ func TestValidateStaticPolicyOptions(t *testing.T) {
 			policyOption:  map[string]string{AlignBySocketOption: "true"},
 			topology:      topoDualSocketMultiNumaPerSocketHT,
 			topoMgrPolicy: topologymanager.PolicyNone,
+			topoMgrScope:  topologymanager.NoneTopologyScope,
 			expectedErr:   false,
 		},
 		{
@@ -179,6 +196,7 @@ func TestValidateStaticPolicyOptions(t *testing.T) {
 			policyOption:  map[string]string{AlignBySocketOption: "true"},
 			topology:      topoDualSocketMultiNumaPerSocketHT,
 			topoMgrPolicy: topologymanager.PolicyBestEffort,
+			topoMgrScope:  topologymanager.NoneTopologyScope,
 			expectedErr:   false,
 		},
 		{
@@ -186,7 +204,16 @@ func TestValidateStaticPolicyOptions(t *testing.T) {
 			policyOption:  map[string]string{AlignBySocketOption: "true"},
 			topology:      topoDualSocketMultiNumaPerSocketHT,
 			topoMgrPolicy: topologymanager.PolicyRestricted,
+			topoMgrScope:  topologymanager.NoneTopologyScope,
 			expectedErr:   false,
+		},
+		{
+			description:   "service cpu pools enabled with container topology scope",
+			policyOption:  map[string]string{ServiceCPUPoolsOption: "true"},
+			topology:      topoDualSocketMultiNumaPerSocketHT,
+			topoMgrPolicy: topologymanager.PolicyNone,
+			topoMgrScope:  topologymanager.ContainerTopologyScope,
+			expectedErr:   true,
 		},
 	}
 	for _, testCase := range testCases {
@@ -195,7 +222,10 @@ func TestValidateStaticPolicyOptions(t *testing.T) {
 			if testCase.topoMgrPolicy == topologymanager.PolicySingleNumaNode {
 				topoMgrPolicy = topologymanager.NewSingleNumaNodePolicy(&topologymanager.NUMAInfo{}, topologymanager.PolicyOptions{})
 			}
-			topoMgrStore := topologymanager.NewFakeManagerWithPolicy(topoMgrPolicy)
+			topoMgrStore := topologymanager.NewFakeManagerWithScope(testCase.topoMgrScope)
+			if testCase.topoMgrScope != topologymanager.ContainerTopologyScope {
+				topoMgrStore = topologymanager.NewFakeManagerWithPolicy(topoMgrPolicy)
+			}
 
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
 			policyOpt, _ := NewStaticPolicyOptions(testCase.policyOption)

@@ -2753,3 +2753,115 @@ func getPodUncoreCacheIDs(s state.Reader, topo *topology.CPUTopology, pod *v1.Po
 	}
 	return uncoreCacheIDs, nil
 }
+
+func TestStaticPolicyReconcileServicePools(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
+
+	policy, err := NewStaticPolicy(
+		logger,
+		topoDualSocketHT,
+		1,
+		cpuset.New(),
+		topologymanager.NewFakeManagerWithScope(topologymanager.PodTopologyScope),
+		map[string]string{ServiceCPUPoolsOption: "true"},
+	)
+	require.NoError(t, err)
+
+	st := state.NewMemoryState(logger)
+	require.NoError(t, policy.Start(logger, st))
+
+	pod1 := makePod("pod1", "container1", "1", "1")
+	pod2 := makePod("pod2", "container2", "1", "1")
+	pod3 := makePod("pod3", "container3", "1", "1")
+	pod4 := makePod("pod4", "container4", "1", "1")
+	for _, pod := range []*v1.Pod{pod1, pod2} {
+		pod.Labels = map[string]string{servicePoolLabelKey: "A"}
+	}
+	for _, pod := range []*v1.Pod{pod3, pod4} {
+		pod.Labels = map[string]string{servicePoolLabelKey: "B"}
+	}
+
+	require.NoError(t, policy.(*staticPolicy).ReconcileState(logger, st, []*v1.Pod{pod1, pod2, pod3, pod4}))
+
+	serviceAssignments := st.GetServiceCPUAssignments()
+	require.Len(t, serviceAssignments, 2)
+	require.Equal(t, 2, serviceAssignments["A"].RequestedCPUs)
+	require.Equal(t, 2, serviceAssignments["B"].RequestedCPUs)
+	require.True(t, serviceAssignments["A"].CPUSet.Intersection(serviceAssignments["B"].CPUSet).IsEmpty())
+
+	for _, pod := range []*v1.Pod{pod1, pod2} {
+		containerName := pod.Spec.Containers[0].Name
+		cset, ok := st.GetCPUSet(string(pod.UID), containerName)
+		require.True(t, ok)
+		require.True(t, cset.Equals(serviceAssignments["A"].CPUSet))
+		assignment, ok := st.GetContainerAssignment(string(pod.UID), containerName)
+		require.True(t, ok)
+		require.Equal(t, state.CPUAssignmentServicePool, assignment.AssignmentType)
+	}
+
+	for _, pod := range []*v1.Pod{pod3, pod4} {
+		containerName := pod.Spec.Containers[0].Name
+		cset, ok := st.GetCPUSet(string(pod.UID), containerName)
+		require.True(t, ok)
+		require.True(t, cset.Equals(serviceAssignments["B"].CPUSet))
+	}
+}
+
+func TestStaticPolicyRemoveContainerKeepsServicePoolAssignments(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
+
+	policy, err := NewStaticPolicy(
+		logger,
+		topoDualSocketHT,
+		1,
+		cpuset.New(),
+		topologymanager.NewFakeManagerWithScope(topologymanager.PodTopologyScope),
+		map[string]string{ServiceCPUPoolsOption: "true"},
+	)
+	require.NoError(t, err)
+
+	st := state.NewMemoryState(logger)
+	require.NoError(t, policy.Start(logger, st))
+
+	pod := makePod("pod", "container", "2", "2")
+	pod.Labels = map[string]string{servicePoolLabelKey: "svc-a"}
+
+	require.NoError(t, policy.(*staticPolicy).ReconcileState(logger, st, []*v1.Pod{pod}))
+	beforeDefault := st.GetDefaultCPUSet()
+	beforePool := st.GetServiceCPUAssignments()["svc-a"].CPUSet
+
+	require.NoError(t, policy.RemoveContainer(logger, st, string(pod.UID), pod.Spec.Containers[0].Name))
+
+	afterPool, ok := st.GetCPUSet(string(pod.UID), pod.Spec.Containers[0].Name)
+	require.True(t, ok)
+	require.True(t, afterPool.Equals(beforePool))
+	require.True(t, st.GetDefaultCPUSet().Equals(beforeDefault))
+}
+
+func TestStaticPolicyReconcileServicePoolsRejectsNonIntegralPodRequests(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
+
+	policy, err := NewStaticPolicy(
+		logger,
+		topoDualSocketHT,
+		1,
+		cpuset.New(),
+		topologymanager.NewFakeManagerWithScope(topologymanager.PodTopologyScope),
+		map[string]string{ServiceCPUPoolsOption: "true"},
+	)
+	require.NoError(t, err)
+
+	st := state.NewMemoryState(logger)
+	require.NoError(t, policy.Start(logger, st))
+
+	pod := makePod("pod", "container", "1500m", "1500m")
+	pod.Labels = map[string]string{servicePoolLabelKey: "svc-a"}
+
+	err = policy.(*staticPolicy).ReconcileState(logger, st, []*v1.Pod{pod})
+	require.Error(t, err)
+	var poolErr *ServiceCPUPoolError
+	require.ErrorAs(t, err, &poolErr)
+}

@@ -35,12 +35,14 @@ const (
 	DistributeCPUsAcrossCoresOption string = "distribute-cpus-across-cores"
 	StrictCPUReservationOption      string = "strict-cpu-reservation"
 	PreferAlignByUnCoreCacheOption  string = "prefer-align-cpus-by-uncorecache"
+	ServiceCPUPoolsOption           string = "service-cpu-pools"
 )
 
 var (
 	alphaOptions = sets.New[string](
 		AlignBySocketOption,
 		DistributeCPUsAcrossCoresOption,
+		ServiceCPUPoolsOption,
 	)
 	betaOptions = sets.New[string](
 		DistributeCPUsAcrossNUMAOption,
@@ -97,6 +99,8 @@ type StaticPolicyOptions struct {
 	// Flag that makes best-effort to align CPUs to a uncorecache boundary
 	// As long as there are CPUs available, pods will be admitted if the condition is not met.
 	PreferAlignByUncoreCacheOption bool
+	// Flag to enable per-service shared CPU pools managed by the static policy.
+	ServiceCPUPools bool
 }
 
 // NewStaticPolicyOptions creates a StaticPolicyOptions struct from the user configuration.
@@ -144,6 +148,12 @@ func NewStaticPolicyOptions(policyOptions map[string]string) (StaticPolicyOption
 				return opts, fmt.Errorf("bad value for option %q: %w", name, err)
 			}
 			opts.PreferAlignByUncoreCacheOption = optValue
+		case ServiceCPUPoolsOption:
+			optValue, err := strconv.ParseBool(value)
+			if err != nil {
+				return opts, fmt.Errorf("bad value for option %q: %w", name, err)
+			}
+			opts.ServiceCPUPools = optValue
 		default:
 			// this should never be reached, we already detect unknown options,
 			// but we keep it as further safety.
@@ -173,6 +183,10 @@ func NewStaticPolicyOptions(policyOptions map[string]string) (StaticPolicyOption
 
 // ValidateStaticPolicyOptions ensures that the requested policy options are compatible with the machine on which the CPUManager is running.
 func ValidateStaticPolicyOptions(opts StaticPolicyOptions, topology *topology.CPUTopology, topologyManager topologymanager.Store) error {
+	if opts.ServiceCPUPools && topologyManager.Name() == topologymanager.ContainerTopologyScope {
+		return fmt.Errorf("Topology manager %s scope is incompatible with CPUManager %s policy option", topologymanager.ContainerTopologyScope, ServiceCPUPoolsOption)
+	}
+
 	if opts.AlignBySocket {
 		// Not compatible with topology manager single-numa-node policy option.
 		if topologyManager.GetPolicy().Name() == topologymanager.PolicySingleNumaNode {

@@ -33,6 +33,8 @@ type Policy interface {
 	Allocate(logger logr.Logger, s state.State, pod *v1.Pod, container *v1.Container) error
 	// RemoveContainer call is idempotent
 	RemoveContainer(logger logr.Logger, s state.State, podUID string, containerName string) error
+	// ReconcileState refreshes policy-owned state using the current set of active pods.
+	ReconcileState(logger logr.Logger, s state.State, activePods []*v1.Pod) error
 	// GetTopologyHints implements the topologymanager.HintProvider Interface
 	// and is consulted to achieve NUMA aware resource alignment among this
 	// and other resource controllers.

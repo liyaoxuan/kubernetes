@@ -275,6 +275,11 @@ func (m *manager) Allocate(p *v1.Pod, c *v1.Container) error {
 	m.Lock()
 	defer m.Unlock()
 
+	if err := m.policy.ReconcileState(logger, m.state, mergeActivePods(m.getActivePods(), p)); err != nil {
+		logger.Error(err, "policy reconcile error")
+		return err
+	}
+
 	// Call down into the policy to assign this container CPUs if required.
 	err := m.policy.Allocate(logger, m.state, p, c)
 	if err != nil {
@@ -293,6 +298,11 @@ func (m *manager) AllocatePod(pod *v1.Pod) error {
 
 	m.Lock()
 	defer m.Unlock()
+
+	if err := m.policy.ReconcileState(logger, m.state, mergeActivePods(m.getActivePods(), pod)); err != nil {
+		logger.Error(err, "policy reconcile error", "pod", klog.KObj(pod))
+		return err
+	}
 
 	// Call down into the policy to assign this container CPUs if required.
 	if err := m.policy.AllocatePod(logger, m.state, pod); err != nil {
@@ -384,11 +394,49 @@ type reconciledContainer struct {
 	containerID   string
 }
 
+func mergeActivePods(activePods []*v1.Pod, extraPods ...*v1.Pod) []*v1.Pod {
+	merged := make([]*v1.Pod, 0, len(activePods)+len(extraPods))
+	seen := make(map[string]struct{}, len(activePods)+len(extraPods))
+
+	for _, pod := range activePods {
+		if pod == nil {
+			continue
+		}
+		uid := string(pod.UID)
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		merged = append(merged, pod)
+	}
+
+	for _, pod := range extraPods {
+		if pod == nil {
+			continue
+		}
+		uid := string(pod.UID)
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		merged = append(merged, pod)
+	}
+
+	return merged
+}
+
+func (m *manager) getActivePods() []*v1.Pod {
+	if m.activePods == nil {
+		return nil
+	}
+	return m.activePods()
+}
+
 func (m *manager) removeStaleState(rootLogger logr.Logger) {
 	// Only once all sources are ready do we attempt to remove any stale state.
 	// This ensures that the call to `m.activePods()` below will succeed with
 	// the actual active pods list.
-	if !m.sourcesReady.AllReady() {
+	if !m.sourcesReady.AllReady() || m.activePods == nil {
 		return
 	}
 
@@ -400,7 +448,7 @@ func (m *manager) removeStaleState(rootLogger logr.Logger) {
 	defer m.Unlock()
 
 	// Get the list of active pods.
-	activePods := m.activePods()
+	activePods := m.getActivePods()
 
 	// Build a list of (podUID, containerName) pairs for all containers in all active Pods.
 	activeContainers := make(map[string]map[string]struct{})
@@ -443,6 +491,10 @@ func (m *manager) removeStaleState(rootLogger logr.Logger) {
 			logger.Error(err, "containerMap: failed to remove container")
 		}
 	})
+
+	if err := m.policy.ReconcileState(rootLogger, m.state, activePods); err != nil {
+		rootLogger.Error(err, "failed to reconcile CPU manager state")
+	}
 }
 
 func (m *manager) reconcileState(ctx context.Context) (success []reconciledContainer, failure []reconciledContainer) {
@@ -452,7 +504,7 @@ func (m *manager) reconcileState(ctx context.Context) (success []reconciledConta
 	rootLogger := klog.FromContext(ctx)
 
 	m.removeStaleState(rootLogger)
-	for _, pod := range m.activePods() {
+	for _, pod := range m.getActivePods() {
 		podLogger := klog.LoggerWithValues(rootLogger, "pod", klog.KObj(pod))
 
 		pstatus, ok := m.podStatusProvider.GetPodStatus(pod.UID)
@@ -561,6 +613,9 @@ func findContainerStatusByName(status *v1.PodStatus, name string) (*v1.Container
 
 func (m *manager) GetExclusiveCPUs(podUID, containerName string) cpuset.CPUSet {
 	if result, ok := m.state.GetCPUSet(podUID, containerName); ok {
+		if assignment, exists := m.state.GetContainerAssignment(podUID, containerName); exists && assignment.AssignmentType == state.CPUAssignmentServicePool {
+			return cpuset.New()
+		}
 		return result
 	}
 	return cpuset.New()
@@ -581,6 +636,10 @@ func resourcesQualifyForExclusiveCPUs(container *v1.Container) bool {
 
 func (m *manager) GetResourceIsolationLevel(pod *v1.Pod, container *v1.Container) cmqos.ResourceIsolationLevel {
 	if _, ok := m.state.GetCPUSet(string(pod.UID), container.Name); !ok {
+		return cmqos.ResourceIsolationHost
+	}
+
+	if assignment, ok := m.state.GetContainerAssignment(string(pod.UID), container.Name); ok && assignment.AssignmentType == state.CPUAssignmentServicePool {
 		return cmqos.ResourceIsolationHost
 	}
 
