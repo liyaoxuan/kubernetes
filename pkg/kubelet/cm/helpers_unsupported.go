@@ -51,6 +51,11 @@ func ResourceConfigForPod(pod *v1.Pod, enforceCPULimit bool, cpuPeriod uint64, e
 	return nil
 }
 
+// ResourceConfigForPodWithQuotaLimit takes the input pod and outputs the cgroup resource config.
+func ResourceConfigForPodWithQuotaLimit(pod *v1.Pod, enforceCPULimit bool, cpuPeriod uint64, enforceMemoryQoS bool, cpuQuotaLimitMilli *int64) *ResourceConfig {
+	return nil
+}
+
 // GetCgroupSubsystems returns information about the mounted cgroup subsystems
 func GetCgroupSubsystems() (*CgroupSubsystems, error) {
 	return nil, nil

@@ -410,6 +410,38 @@ func TestResourceConfigForPod(t *testing.T) {
 	}
 }
 
+func TestResourceConfigForPodWithQuotaLimitOverride(t *testing.T) {
+	defaultQuotaPeriod := uint64(100 * time.Millisecond / time.Microsecond) // in microseconds
+	overrideQuotaLimit := int64(3000)
+	expectedShares := MilliCPUToShares(1000)
+	expectedQuota := MilliCPUToQuota(overrideQuotaLimit, int64(defaultQuotaPeriod))
+	expectedMemory := resource.MustParse("100Mi").Value()
+
+	pod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Resources: getResourceRequirements(getResourceList("1", "100Mi"), getResourceList("1", "100Mi")),
+				},
+			},
+		},
+	}
+
+	actual := ResourceConfigForPodWithQuotaLimit(pod, true, defaultQuotaPeriod, false, &overrideQuotaLimit)
+	if actual == nil {
+		t.Fatal("expected resource config, got nil")
+	}
+	if actual.CPUQuota == nil || *actual.CPUQuota != expectedQuota {
+		t.Fatalf("expected CPU quota %d, got %#v", expectedQuota, actual.CPUQuota)
+	}
+	if actual.CPUShares == nil || *actual.CPUShares != expectedShares {
+		t.Fatalf("expected CPU shares %d, got %#v", expectedShares, actual.CPUShares)
+	}
+	if actual.Memory == nil || *actual.Memory != expectedMemory {
+		t.Fatalf("expected memory limit %d, got %#v", expectedMemory, actual.Memory)
+	}
+}
+
 func TestResourceConfigForPodWithCustomCPUCFSQuotaPeriod(t *testing.T) {
 	defaultQuotaPeriod := uint64(100 * time.Millisecond / time.Microsecond) // in microseconds
 	tunedQuotaPeriod := uint64(5 * time.Millisecond / time.Microsecond)     // in microseconds

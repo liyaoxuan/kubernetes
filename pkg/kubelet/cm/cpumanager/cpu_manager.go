@@ -573,3 +573,29 @@ func (m *manager) GetExclusiveCPUs(podUID, containerName string) cpuset.CPUSet {
 func (m *manager) GetCPUAffinity(podUID, containerName string) cpuset.CPUSet {
 	return m.state.GetCPUSetOrDefault(podUID, containerName)
 }
+
+func (m *manager) GetPodCPUQuotaLimit(pod *v1.Pod) (int64, bool) {
+	if pod == nil {
+		return 0, false
+	}
+	podAssignment, ok := m.state.GetPodServiceAssignment(string(pod.UID))
+	if !ok || podAssignment.Service == "" {
+		return 0, false
+	}
+	serviceAssignment, ok := m.state.GetServiceCPUAssignment(podAssignment.Service)
+	if !ok || serviceAssignment.RequestedCPUs <= 0 {
+		return 0, false
+	}
+	return int64(serviceAssignment.RequestedCPUs * 1000), true
+}
+
+func (m *manager) GetContainerCPUQuotaLimit(pod *v1.Pod, container *v1.Container) (int64, bool) {
+	if pod == nil || container == nil {
+		return 0, false
+	}
+	assignment, ok := m.state.GetContainerAssignment(string(pod.UID), container.Name)
+	if !ok || assignment.AssignmentType != state.CPUAssignmentServicePool {
+		return 0, false
+	}
+	return m.GetPodCPUQuotaLimit(pod)
+}

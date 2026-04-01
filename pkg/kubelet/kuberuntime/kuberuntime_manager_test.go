@@ -68,6 +68,32 @@ func createTestRuntimeManager() (*apitest.FakeRuntimeService, *apitest.FakeImage
 	return customTestRuntimeManager(&credentialprovider.BasicDockerKeyring{})
 }
 
+type cpuQuotaLimitContainerManager struct {
+	cm.ContainerManager
+	podQuotaLimitMilliCPU       int64
+	containerQuotaLimitMilliCPU map[string]int64
+}
+
+func quotaOverrideKey(pod *v1.Pod, container *v1.Container) string {
+	return fmt.Sprintf("%s/%s", pod.UID, container.Name)
+}
+
+func (m *cpuQuotaLimitContainerManager) GetPodCPUQuotaLimit(pod *v1.Pod) (int64, bool) {
+	if m.podQuotaLimitMilliCPU <= 0 {
+		return 0, false
+	}
+	return m.podQuotaLimitMilliCPU, true
+}
+
+func (m *cpuQuotaLimitContainerManager) GetContainerCPUQuotaLimit(pod *v1.Pod, container *v1.Container) (int64, bool) {
+	if m.containerQuotaLimitMilliCPU != nil {
+		if limit, found := m.containerQuotaLimitMilliCPU[quotaOverrideKey(pod, container)]; found {
+			return limit, true
+		}
+	}
+	return m.GetPodCPUQuotaLimit(pod)
+}
+
 func customTestRuntimeManager(keyring *credentialprovider.BasicDockerKeyring) (*apitest.FakeRuntimeService, *apitest.FakeImageService, *kubeGenericRuntimeManager, error) {
 	fakeRuntimeService := apitest.NewFakeRuntimeService()
 	fakeImageService := apitest.NewFakeImageService()
@@ -311,6 +337,52 @@ func TestContainerRuntimeType(t *testing.T) {
 
 	runtimeType := m.Type()
 	assert.Equal(t, apitest.FakeRuntimeName, runtimeType)
+}
+
+func TestComputePodResizeActionUsesCPUQuotaOverride(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	assert.NoError(t, err)
+
+	pod := makeTestPod("pod", "ns", "poduid", []v1.Container{
+		{
+			Name: "container",
+			Resources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("1"),
+					v1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+				Limits: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("1"),
+					v1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+			},
+		},
+	})
+	m.containerManager = &cpuQuotaLimitContainerManager{
+		ContainerManager:          m.containerManager,
+		podQuotaLimitMilliCPU:     3000,
+		containerQuotaLimitMilliCPU: map[string]int64{quotaOverrideKey(pod, &pod.Spec.Containers[0]): 3000},
+	}
+
+	status := &kubecontainer.Status{
+		ID:    kubecontainer.ContainerID{Type: "fake", ID: "cid"},
+		Name:  "container",
+		State: kubecontainer.ContainerStateRunning,
+		Resources: &kubecontainer.ContainerResources{
+			CPULimit:    resource.NewMilliQuantity(1000, resource.DecimalSI),
+			CPURequest:  resource.NewMilliQuantity(1000, resource.DecimalSI),
+			MemoryLimit: resource.NewQuantity(128*1024*1024, resource.BinarySI),
+		},
+	}
+	changes := &podActions{
+		ContainersToUpdate: make(map[v1.ResourceName][]containerToUpdateInfo),
+		ContainersToKill:   make(map[kubecontainer.ContainerID]containerToKillInfo),
+	}
+
+	keep := m.computePodResizeAction(pod, 0, status, changes)
+	assert.True(t, keep)
+	require.Len(t, changes.ContainersToUpdate[v1.ResourceCPU], 1)
+	assert.Equal(t, int64(3000), changes.ContainersToUpdate[v1.ResourceCPU][0].desiredContainerResources.cpuLimit)
 }
 
 func TestGetPodStatus(t *testing.T) {

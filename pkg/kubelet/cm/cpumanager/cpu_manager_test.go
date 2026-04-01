@@ -1629,3 +1629,41 @@ func TestCPUManagerGetExclusiveCPUsSkipsServicePools(t *testing.T) {
 		t.Fatalf("expected exclusive allocation to remain visible, got %q", got)
 	}
 }
+
+func TestCPUManagerGetCPUQuotaLimitServicePools(t *testing.T) {
+	mgr := &manager{
+		state: &mockState{
+			containerAssignments: state.ContainerAssignments{
+				"pod-a": {
+					"container-a": {
+						AssignmentType: state.CPUAssignmentServicePool,
+					},
+				},
+			},
+			serviceAssignments: state.ServiceCPUAssignments{
+				"service-a": {
+					RequestedCPUs: 3,
+				},
+			},
+			podServiceAssignments: state.PodServiceAssignments{
+				"pod-a": {
+					Service:       "service-a",
+					RequestedCPUs: 1,
+				},
+			},
+		},
+	}
+
+	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "pod-a"}}
+	container := &v1.Container{Name: "container-a"}
+
+	if got, ok := mgr.GetPodCPUQuotaLimit(pod); !ok || got != 3000 {
+		t.Fatalf("expected pod quota limit 3000m, got %d, %t", got, ok)
+	}
+	if got, ok := mgr.GetContainerCPUQuotaLimit(pod, container); !ok || got != 3000 {
+		t.Fatalf("expected container quota limit 3000m, got %d, %t", got, ok)
+	}
+	if got, ok := mgr.GetContainerCPUQuotaLimit(pod, &v1.Container{Name: "other"}); ok || got != 0 {
+		t.Fatalf("expected non-pooled container to report no quota override, got %d, %t", got, ok)
+	}
+}

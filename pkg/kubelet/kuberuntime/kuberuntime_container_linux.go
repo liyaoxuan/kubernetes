@@ -133,7 +133,7 @@ func (m *kubeGenericRuntimeManager) generateLinuxContainerResources(pod *v1.Pod,
 
 	memoryLimit := getMemoryLimit(pod, container)
 	cpuLimit := getCPULimit(pod, container)
-	lcr := m.calculateLinuxResources(cpuRequest, cpuLimit, memoryLimit)
+	lcr := m.calculateLinuxResourcesWithCPUQuota(cpuRequest, cpuLimit, memoryLimit, m.getContainerCPUQuotaLimit(pod, container))
 
 	lcr.OomScoreAdj = int64(qos.GetContainerOOMScoreAdjust(pod, container,
 		int64(m.machineInfo.MemoryCapacity)))
@@ -245,6 +245,12 @@ func (m *kubeGenericRuntimeManager) generateContainerResources(pod *v1.Pod, cont
 
 // calculateLinuxResources will create the linuxContainerResources type based on the provided CPU and memory resource requests, limits
 func (m *kubeGenericRuntimeManager) calculateLinuxResources(cpuRequest, cpuLimit, memoryLimit *resource.Quantity) *runtimeapi.LinuxContainerResources {
+	return m.calculateLinuxResourcesWithCPUQuota(cpuRequest, cpuLimit, memoryLimit, nil)
+}
+
+// calculateLinuxResourcesWithCPUQuota will create linux container resources based on the provided CPU and memory
+// resource requests, limits, and an optional CPU quota override in milliCPU.
+func (m *kubeGenericRuntimeManager) calculateLinuxResourcesWithCPUQuota(cpuRequest, cpuLimit, memoryLimit *resource.Quantity, cpuQuotaLimitMilli *int64) *runtimeapi.LinuxContainerResources {
 	resources := runtimeapi.LinuxContainerResources{}
 	var cpuShares int64
 
@@ -274,7 +280,11 @@ func (m *kubeGenericRuntimeManager) calculateLinuxResources(cpuRequest, cpuLimit
 			// but we need to convert it to number of microseconds which is used by kernel.
 			cpuPeriod = int64(m.cpuCFSQuotaPeriod.Duration / time.Microsecond)
 		}
-		cpuQuota := milliCPUToQuota(cpuLimit.MilliValue(), cpuPeriod)
+		cpuQuotaLimit := cpuLimit.MilliValue()
+		if cpuQuotaLimitMilli != nil {
+			cpuQuotaLimit = *cpuQuotaLimitMilli
+		}
+		cpuQuota := milliCPUToQuota(cpuQuotaLimit, cpuPeriod)
 		resources.CpuQuota = cpuQuota
 		resources.CpuPeriod = cpuPeriod
 	}
@@ -289,6 +299,28 @@ func (m *kubeGenericRuntimeManager) calculateLinuxResources(cpuRequest, cpuLimit
 		}
 	}
 	return &resources
+}
+
+func (m *kubeGenericRuntimeManager) getPodCPUQuotaLimit(pod *v1.Pod) *int64 {
+	if provider, ok := m.containerManager.(interface {
+		GetPodCPUQuotaLimit(pod *v1.Pod) (int64, bool)
+	}); ok {
+		if limit, found := provider.GetPodCPUQuotaLimit(pod); found {
+			return &limit
+		}
+	}
+	return nil
+}
+
+func (m *kubeGenericRuntimeManager) getContainerCPUQuotaLimit(pod *v1.Pod, container *v1.Container) *int64 {
+	if provider, ok := m.containerManager.(interface {
+		GetContainerCPUQuotaLimit(pod *v1.Pod, container *v1.Container) (int64, bool)
+	}); ok {
+		if limit, found := provider.GetContainerCPUQuotaLimit(pod, container); found {
+			return &limit
+		}
+	}
+	return nil
 }
 
 // GetHugepageLimitsFromResources returns limits of each hugepages from resources.

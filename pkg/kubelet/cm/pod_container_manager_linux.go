@@ -31,6 +31,7 @@ import (
 	"k8s.io/klog/v2"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
 )
 
 const (
@@ -55,6 +56,8 @@ type podContainerManagerImpl struct {
 	// cpuCFSQuotaPeriod is the cfs period value, cfs_period_us, setting per
 	// node for all containers in usec
 	cpuCFSQuotaPeriod uint64
+	// cpuManager provides optional service-pool-aware quota overrides.
+	cpuManager cpumanager.Manager
 }
 
 // Make sure that podContainerManagerImpl implements the PodContainerManager interface
@@ -80,9 +83,17 @@ func (m *podContainerManagerImpl) EnsureExists(pod *v1.Pod) error {
 		}
 		// Create the pod container
 		podContainerName, _ := m.GetPodContainerName(pod)
+		var cpuQuotaLimitMilli *int64
+		if provider, ok := m.cpuManager.(interface {
+			GetPodCPUQuotaLimit(pod *v1.Pod) (int64, bool)
+		}); ok {
+			if limit, found := provider.GetPodCPUQuotaLimit(pod); found {
+				cpuQuotaLimitMilli = &limit
+			}
+		}
 		containerConfig := &CgroupConfig{
 			Name:               podContainerName,
-			ResourceParameters: ResourceConfigForPod(pod, m.enforceCPULimits, m.cpuCFSQuotaPeriod, enforceMemoryQoS),
+			ResourceParameters: ResourceConfigForPodWithQuotaLimit(pod, m.enforceCPULimits, m.cpuCFSQuotaPeriod, enforceMemoryQoS, cpuQuotaLimitMilli),
 		}
 		if m.podPidsLimit > 0 {
 			containerConfig.ResourceParameters.PidsLimit = &m.podPidsLimit

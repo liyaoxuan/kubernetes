@@ -366,11 +366,30 @@ func (cm *containerManagerImpl) NewPodContainerManager() PodContainerManager {
 			// cpuCFSQuotaPeriod is in microseconds. NodeConfig.CPUCFSQuotaPeriod is time.Duration (measured in nano seconds).
 			// Convert (cm.CPUCFSQuotaPeriod) [nanoseconds] / time.Microsecond (1000) to get cpuCFSQuotaPeriod in microseconds.
 			cpuCFSQuotaPeriod: uint64(cm.CPUCFSQuotaPeriod / time.Microsecond),
+			cpuManager:        cm.cpuManager,
 		}
 	}
 	return &podContainerManagerNoop{
 		cgroupRoot: cm.cgroupRoot,
 	}
+}
+
+func (cm *containerManagerImpl) GetPodCPUQuotaLimit(pod *v1.Pod) (int64, bool) {
+	if provider, ok := cm.cpuManager.(interface {
+		GetPodCPUQuotaLimit(pod *v1.Pod) (int64, bool)
+	}); ok {
+		return provider.GetPodCPUQuotaLimit(pod)
+	}
+	return 0, false
+}
+
+func (cm *containerManagerImpl) GetContainerCPUQuotaLimit(pod *v1.Pod, container *v1.Container) (int64, bool) {
+	if provider, ok := cm.cpuManager.(interface {
+		GetContainerCPUQuotaLimit(pod *v1.Pod, container *v1.Container) (int64, bool)
+	}); ok {
+		return provider.GetContainerCPUQuotaLimit(pod, container)
+	}
+	return 0, false
 }
 
 func (cm *containerManagerImpl) InternalContainerLifecycle() InternalContainerLifecycle {

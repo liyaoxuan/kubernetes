@@ -122,6 +122,12 @@ func HugePageLimits(resourceList v1.ResourceList) map[int64]int64 {
 
 // ResourceConfigForPod takes the input pod and outputs the cgroup resource config.
 func ResourceConfigForPod(allocatedPod *v1.Pod, enforceCPULimits bool, cpuPeriod uint64, enforceMemoryQoS bool) *ResourceConfig {
+	return ResourceConfigForPodWithQuotaLimit(allocatedPod, enforceCPULimits, cpuPeriod, enforceMemoryQoS, nil)
+}
+
+// ResourceConfigForPodWithQuotaLimit takes the input pod and outputs the cgroup
+// resource config, optionally overriding the CPU quota limit in milliCPU.
+func ResourceConfigForPodWithQuotaLimit(allocatedPod *v1.Pod, enforceCPULimits bool, cpuPeriod uint64, enforceMemoryQoS bool, cpuQuotaLimitMilli *int64) *ResourceConfig {
 	podLevelResourcesEnabled := utilfeature.DefaultFeatureGate.Enabled(kubefeatures.PodLevelResources)
 	// sum requests and limits.
 	reqs := resource.PodRequests(allocatedPod, resource.PodResourcesOptions{
@@ -166,6 +172,10 @@ func ResourceConfigForPod(allocatedPod *v1.Pod, enforceCPULimits bool, cpuPeriod
 	}
 	if limit, found := limits[v1.ResourceCPU]; found {
 		cpuLimits = limit.MilliValue()
+	}
+	if cpuQuotaLimitMilli != nil {
+		cpuLimits = *cpuQuotaLimitMilli
+		cpuLimitsDeclared = true
 	}
 	if limit, found := limits[v1.ResourceMemory]; found {
 		memoryLimits = limit.Value()

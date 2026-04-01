@@ -264,6 +264,46 @@ func TestGenerateLinuxContainerConfigResources(t *testing.T) {
 	}
 }
 
+func TestGenerateLinuxContainerConfigResourcesWithCPUQuotaOverride(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	m.cpuCFSQuota = true
+	assert.NoError(t, err)
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: "poduid",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name: "container",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("128Mi"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("256Mi"),
+						},
+					},
+				},
+			},
+		},
+	}
+	m.containerManager = &cpuQuotaLimitContainerManager{
+		ContainerManager:          m.containerManager,
+		podQuotaLimitMilliCPU:     3000,
+		containerQuotaLimitMilliCPU: map[string]int64{quotaOverrideKey(pod, &pod.Spec.Containers[0]): 3000},
+	}
+
+	resources := m.generateLinuxContainerResources(pod, &pod.Spec.Containers[0], false)
+	assert.Equal(t, int64(1024), resources.CpuShares)
+	assert.Equal(t, int64(300000), resources.CpuQuota)
+	assert.Equal(t, int64(100000), resources.CpuPeriod)
+	assert.Equal(t, int64(256*1024*1024), resources.MemoryLimitInBytes)
+}
+
 func TestCalculateLinuxResources(t *testing.T) {
 	_, _, m, err := createTestRuntimeManager()
 	m.cpuCFSQuota = true
