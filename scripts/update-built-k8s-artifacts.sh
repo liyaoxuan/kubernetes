@@ -27,6 +27,7 @@ IMAGE_NAMES_CSV="${IMAGE_NAMES:-}"
 DRY_RUN=false
 SKIP_IMAGES=false
 SKIP_BINARIES=false
+SKIP_ROLLOUT=false
 
 readonly DEFAULT_BINARIES=(kubectl kubelet kubeadm)
 readonly DEFAULT_IMAGES=(kube-apiserver kube-controller-manager kube-scheduler kube-proxy kubectl)
@@ -58,12 +59,15 @@ Options:
   --ssh-user USER            Use USER@host for ssh/scp.
   --skip-binaries            Only retag and push images.
   --skip-images              Only update kubectl/kubelet/kubeadm.
+  --skip-rollout             Do not update kube-system workloads to the new images.
   --dry-run                  Print actions without executing them.
   -h, --help                 Show this help.
 
 Notes:
   - Existing kubectl/kubelet/kubeadm binaries are overwritten in place without backup.
   - kubelet is restarted on each node after the binaries are installed.
+  - After pushing images, kube-apiserver/kube-controller-manager/kube-scheduler static pods
+    on the master and the kube-proxy DaemonSet are updated to the new image refs.
   - The script expects passwordless ssh/scp plus sudo access on cpu-16/cpu-15/cpu-17.
 EOF
 }
@@ -124,19 +128,19 @@ ssh_target() {
   fi
 }
 
-join_by() {
-  local delimiter=$1
-  shift
-  local first=true
-  local item
-  for item in "$@"; do
-    if "${first}"; then
-      printf '%s' "${item}"
-      first=false
-    else
-      printf '%s%s' "${delimiter}" "${item}"
-    fi
-  done
+local_hostname_short() {
+  hostname -s 2>/dev/null || hostname
+}
+
+is_local_node() {
+  local node=$1
+  local short
+  local full
+
+  short=$(local_hostname_short)
+  full=$(hostname 2>/dev/null || true)
+
+  [[ "${node}" == "${short}" || -n "${full}" && "${node}" == "${full}" ]]
 }
 
 parse_args() {
@@ -188,6 +192,10 @@ parse_args() {
         ;;
       --skip-images)
         SKIP_IMAGES=true
+        shift
+        ;;
+      --skip-rollout)
+        SKIP_ROLLOUT=true
         shift
         ;;
       --dry-run)
@@ -360,12 +368,10 @@ update_binaries() {
   local -a local_sources=()
   local node
   local binary
-  local local_hostname
   local tmp_dir="${REMOTE_TMP_ROOT}/$(date +%Y%m%d%H%M%S)"
 
   csv_to_array "${WORKER_NODES_CSV}" worker_nodes
   all_nodes=("${MASTER_NODE}" "${worker_nodes[@]}")
-  local_hostname=$(hostname -s 2>/dev/null || hostname)
 
   for binary in "${binaries[@]}"; do
     local_sources+=("$(resolve_local_binary_path "${binary}" "${output_dir}")")
@@ -374,7 +380,7 @@ update_binaries() {
   log "Updating kubectl/kubelet/kubeadm from ${output_dir}"
 
   for node in "${all_nodes[@]}"; do
-    if [[ "${node}" == "${local_hostname}" ]]; then
+    if is_local_node "${node}"; then
       log "Installing binaries on local node ${node}"
       local idx
       for idx in "${!binaries[@]}"; do
@@ -394,6 +400,11 @@ update_binaries() {
     run scp "${local_sources[@]}" "${remote}:$(printf '%q' "${tmp_dir}")/"
     run ssh "${remote}" "$(build_remote_install_script "${tmp_dir}" "${binaries[@]}")"
   done
+}
+
+image_ref_for() {
+  local image_name=$1
+  printf '%s/%s-%s:%s\n' "${TARGET_REGISTRY}" "${image_name}" "${ARCH}" "${KUBE_TAG}"
 }
 
 discover_image_names() {
@@ -452,7 +463,8 @@ push_images() {
 
   for image_name in "${image_names[@]}"; do
     local source_ref="${SOURCE_REGISTRY}/${image_name}-${ARCH}:${KUBE_TAG}"
-    local target_ref="${TARGET_REGISTRY}/${image_name}-${ARCH}:${KUBE_TAG}"
+    local target_ref
+    target_ref=$(image_ref_for "${image_name}")
 
     ensure_source_image_present "${image_name}" "${archive_dir}" "${source_ref}" "${target_ref}"
 
@@ -464,6 +476,96 @@ push_images() {
 
     run docker push "${target_ref}"
   done
+}
+
+build_master_rollout_script() {
+  local master_node=$1
+  local apiserver_image=$2
+  local controller_manager_image=$3
+  local scheduler_image=$4
+  local kube_proxy_image=$5
+  local timeout_seconds=300
+
+  cat <<EOF
+set -euo pipefail
+
+kubeconfig=/etc/kubernetes/admin.conf
+timeout_seconds=${timeout_seconds}
+master_node=$(printf '%q' "${master_node}")
+apiserver_image=$(printf '%q' "${apiserver_image}")
+controller_manager_image=$(printf '%q' "${controller_manager_image}")
+scheduler_image=$(printf '%q' "${scheduler_image}")
+kube_proxy_image=$(printf '%q' "${kube_proxy_image}")
+
+update_static_pod_manifest() {
+  local component=\$1
+  local image_ref=\$2
+  local manifest="/etc/kubernetes/manifests/\${component}.yaml"
+
+  [[ -f "\${manifest}" ]] || {
+    echo "missing manifest: \${manifest}" >&2
+    return 1
+  }
+
+  sudo sed -i -E "0,/^[[:space:]]*image:[[:space:]]*/s#(^[[:space:]]*image:[[:space:]]*).*$#\\\\1\${image_ref}#" "\${manifest}"
+}
+
+wait_for_static_pod() {
+  local pod_name=\$1
+  local image_ref=\$2
+  local deadline=\$((SECONDS + timeout_seconds))
+  local current_image
+  local ready
+
+  while (( SECONDS < deadline )); do
+    current_image=\$(sudo kubectl --kubeconfig="\${kubeconfig}" -n kube-system get pod "\${pod_name}" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || true)
+    ready=\$(sudo kubectl --kubeconfig="\${kubeconfig}" -n kube-system get pod "\${pod_name}" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+
+    if [[ "\${current_image}" == "\${image_ref}" && "\${ready}" == "true" ]]; then
+      return 0
+    fi
+
+    sleep 5
+  done
+
+  echo "timed out waiting for \${pod_name} to use \${image_ref}" >&2
+  return 1
+}
+
+update_static_pod_manifest kube-apiserver "\${apiserver_image}"
+wait_for_static_pod "kube-apiserver-\${master_node}" "\${apiserver_image}"
+
+update_static_pod_manifest kube-controller-manager "\${controller_manager_image}"
+wait_for_static_pod "kube-controller-manager-\${master_node}" "\${controller_manager_image}"
+
+update_static_pod_manifest kube-scheduler "\${scheduler_image}"
+wait_for_static_pod "kube-scheduler-\${master_node}" "\${scheduler_image}"
+
+sudo kubectl --kubeconfig="\${kubeconfig}" -n kube-system set image daemonset/kube-proxy kube-proxy="\${kube_proxy_image}" >/dev/null
+sudo kubectl --kubeconfig="\${kubeconfig}" -n kube-system rollout status daemonset/kube-proxy --timeout=5m
+EOF
+}
+
+rollout_kube_system_images() {
+  local apiserver_image
+  local controller_manager_image
+  local scheduler_image
+  local kube_proxy_image
+
+  apiserver_image=$(image_ref_for "kube-apiserver")
+  controller_manager_image=$(image_ref_for "kube-controller-manager")
+  scheduler_image=$(image_ref_for "kube-scheduler")
+  kube_proxy_image=$(image_ref_for "kube-proxy")
+
+  log "Updating kube-system workloads to the new control-plane and kube-proxy images"
+
+  if is_local_node "${MASTER_NODE}"; then
+    run bash -lc "$(build_master_rollout_script "${MASTER_NODE}" "${apiserver_image}" "${controller_manager_image}" "${scheduler_image}" "${kube_proxy_image}")"
+  else
+    local remote
+    remote=$(ssh_target "${MASTER_NODE}")
+    run ssh "${remote}" "$(build_master_rollout_script "${MASTER_NODE}" "${apiserver_image}" "${controller_manager_image}" "${scheduler_image}" "${kube_proxy_image}")"
+  fi
 }
 
 main() {
@@ -483,6 +585,10 @@ main() {
     local image_archive_dir
     image_archive_dir=$(discover_image_archive_dir)
     push_images "${image_archive_dir}"
+
+    if ! "${SKIP_ROLLOUT}"; then
+      rollout_kube_system_images
+    fi
   fi
 
   log "Update completed successfully"
