@@ -501,13 +501,33 @@ update_static_pod_manifest() {
   local component=\$1
   local image_ref=\$2
   local manifest="/etc/kubernetes/manifests/\${component}.yaml"
+  local tmp_file
 
   [[ -f "\${manifest}" ]] || {
     echo "missing manifest: \${manifest}" >&2
     return 1
   }
 
-  sudo sed -i -E "0,/^[[:space:]]*image:[[:space:]]*/s#(^[[:space:]]*image:[[:space:]]*).*$#\\\\1\${image_ref}#" "\${manifest}"
+  tmp_file=\$(mktemp)
+  awk -v image_ref="\${image_ref}" '
+    BEGIN { updated = 0 }
+    !updated && \$0 ~ /^[[:space:]]*image:[[:space:]]*/ {
+      match(\$0, /^[[:space:]]*/)
+      indent = substr(\$0, RSTART, RLENGTH)
+      print indent "image: " image_ref
+      updated = 1
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        exit 2
+      }
+    }
+  ' "\${manifest}" > "\${tmp_file}"
+
+  sudo install -m 0644 "\${tmp_file}" "\${manifest}"
+  rm -f "\${tmp_file}"
 }
 
 wait_for_static_pod() {
