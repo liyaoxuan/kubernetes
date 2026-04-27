@@ -1174,15 +1174,15 @@ func TestStaticPolicyReconcileStateServicePools(t *testing.T) {
 	})
 	podA1.Name = "pod-a1"
 	podA1.UID = "pod-a1"
-	podA1.Labels = map[string]string{servicePoolLabelKey: "service-a"}
+	podA1.Labels = map[string]string{defaultServiceCPUPoolsLabelKey: "service-a"}
 
 	podA2 := makePod("pod-a2", "container-a2", "1000m", "1000m")
 	podA2.Name = "pod-a2"
-	podA2.Labels = map[string]string{servicePoolLabelKey: "service-a"}
+	podA2.Labels = map[string]string{defaultServiceCPUPoolsLabelKey: "service-a"}
 
 	podB1 := makePod("pod-b1", "container-b1", "2000m", "2000m")
 	podB1.Name = "pod-b1"
-	podB1.Labels = map[string]string{servicePoolLabelKey: "service-b"}
+	podB1.Labels = map[string]string{defaultServiceCPUPoolsLabelKey: "service-b"}
 
 	if err := policy.ReconcileState(st, []*v1.Pod{podB1, podA2, podA1}); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
@@ -1251,6 +1251,62 @@ func TestStaticPolicyReconcileStateServicePools(t *testing.T) {
 	}
 }
 
+func TestStaticPolicyReconcileStateServicePoolsCustomLabelKey(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
+
+	const customLabelKey = "example.com/service-pool"
+
+	p, err := NewStaticPolicy(topoSingleSocketHT, 1, cpuset.New(), topologymanager.NewFakeManager(), map[string]string{
+		ServiceCPUPoolsOption:         "true",
+		ServiceCPUPoolsLabelKeyOption: customLabelKey,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating static policy: %v", err)
+	}
+	policy := p.(*staticPolicy)
+
+	st := &mockState{
+		assignments:           state.ContainerCPUAssignments{},
+		containerAssignments:  state.ContainerAssignments{},
+		serviceAssignments:    state.ServiceCPUAssignments{},
+		podServiceAssignments: state.PodServiceAssignments{},
+	}
+	if err := policy.Start(st); err != nil {
+		t.Fatalf("unexpected error starting static policy: %v", err)
+	}
+
+	customKeyPod := makePod("custom-key-pod", "custom-key-container", "1000m", "1000m")
+	customKeyPod.Name = "custom-key-pod"
+	customKeyPod.Labels = map[string]string{customLabelKey: "service-a"}
+
+	defaultKeyPod := makePod("default-key-pod", "default-key-container", "1000m", "1000m")
+	defaultKeyPod.Name = "default-key-pod"
+	defaultKeyPod.Labels = map[string]string{defaultServiceCPUPoolsLabelKey: "service-b"}
+
+	if err := policy.ReconcileState(st, []*v1.Pod{defaultKeyPod, customKeyPod}); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	serviceA, ok := st.GetServiceCPUAssignment("service-a")
+	if !ok {
+		t.Fatal("expected service-a pool to exist")
+	}
+	if serviceA.RequestedCPUs != 1 || serviceA.CPUSet.Size() != 1 {
+		t.Fatalf("unexpected service-a pool: %+v", serviceA)
+	}
+
+	cset, ok := st.GetCPUSet(string(customKeyPod.UID), customKeyPod.Spec.Containers[0].Name)
+	if !ok || !cset.Equals(serviceA.CPUSet) {
+		t.Fatalf("expected custom-key pod to use service-a pool %q, got %q", serviceA.CPUSet, cset)
+	}
+	if _, ok := st.GetCPUSet(string(defaultKeyPod.UID), defaultKeyPod.Spec.Containers[0].Name); ok {
+		t.Fatal("expected pod with only the default service label key to be ignored")
+	}
+	if _, ok := st.GetServiceCPUAssignment("service-b"); ok {
+		t.Fatal("expected no service-b pool for pod with only the default service label key")
+	}
+}
+
 func TestStaticPolicyRemoveContainerServicePoolNoop(t *testing.T) {
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
 
@@ -1274,7 +1330,7 @@ func TestStaticPolicyRemoveContainerServicePoolNoop(t *testing.T) {
 
 	pod := makePod("pod-a", "container-a", "1000m", "1000m")
 	pod.Name = "pod-a"
-	pod.Labels = map[string]string{servicePoolLabelKey: "service-a"}
+	pod.Labels = map[string]string{defaultServiceCPUPoolsLabelKey: "service-a"}
 
 	if err := policy.ReconcileState(st, []*v1.Pod{pod}); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
@@ -1301,18 +1357,24 @@ type staticPolicyOptionTestCase struct {
 }
 
 func TestStaticPolicyOptions(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
+
+	defaultOptions := StaticPolicyOptions{
+		ServiceCPUPoolsLabelKey: defaultServiceCPUPoolsLabelKey,
+	}
+
 	testCases := []staticPolicyOptionTestCase{
 		{
 			description:   "nil args",
 			policyOptions: nil,
 			expectedError: false,
-			expectedValue: StaticPolicyOptions{},
+			expectedValue: defaultOptions,
 		},
 		{
 			description:   "empty args",
 			policyOptions: map[string]string{},
 			expectedError: false,
-			expectedValue: StaticPolicyOptions{},
+			expectedValue: defaultOptions,
 		},
 		{
 			description: "bad single arg",
@@ -1336,8 +1398,35 @@ func TestStaticPolicyOptions(t *testing.T) {
 			},
 			expectedError: false,
 			expectedValue: StaticPolicyOptions{
-				FullPhysicalCPUsOnly: true,
+				FullPhysicalCPUsOnly:    true,
+				ServiceCPUPoolsLabelKey: defaultServiceCPUPoolsLabelKey,
 			},
+		},
+		{
+			description: "service pool custom label key",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsOption:         "true",
+				ServiceCPUPoolsLabelKeyOption: "example.com/service-pool",
+			},
+			expectedError: false,
+			expectedValue: StaticPolicyOptions{
+				ServiceCPUPools:         true,
+				ServiceCPUPoolsLabelKey: "example.com/service-pool",
+			},
+		},
+		{
+			description: "service pool empty label key",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsLabelKeyOption: "",
+			},
+			expectedError: true,
+		},
+		{
+			description: "service pool invalid label key",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsLabelKeyOption: "example.com/bad/key",
+			},
+			expectedError: true,
 		},
 		{
 			description: "good arg, bad value",

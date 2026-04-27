@@ -45,8 +45,6 @@ const (
 	ErrorSMTAlignment = "SMTAlignmentError"
 	// ErrorServiceCPUPool represents the type of a ServiceCPUPoolError.
 	ErrorServiceCPUPool = "ServiceCPUPoolError"
-
-	servicePoolLabelKey = "service"
 )
 
 // SMTAlignmentError represents an error due to SMT alignment
@@ -376,11 +374,18 @@ func (p *staticPolicy) servicePoolEnabled() bool {
 	return p.options.ServiceCPUPools
 }
 
+func (p *staticPolicy) servicePoolLabelKey() string {
+	if p.options.ServiceCPUPoolsLabelKey == "" {
+		return defaultServiceCPUPoolsLabelKey
+	}
+	return p.options.ServiceCPUPoolsLabelKey
+}
+
 func (p *staticPolicy) serviceLabelForPod(pod *v1.Pod) (string, bool) {
 	if pod == nil || pod.Labels == nil {
 		return "", false
 	}
-	service, ok := pod.Labels[servicePoolLabelKey]
+	service, ok := pod.Labels[p.servicePoolLabelKey()]
 	if !ok {
 		return "", false
 	}
@@ -397,7 +402,7 @@ func (p *staticPolicy) podServiceAssignment(pod *v1.Pod) (state.PodServiceAssign
 		return state.PodServiceAssignment{}, false, nil
 	}
 	if service == "" {
-		return state.PodServiceAssignment{}, false, newServiceCPUPoolError("pod %s has an empty %q label", klog.KObj(pod), servicePoolLabelKey)
+		return state.PodServiceAssignment{}, false, newServiceCPUPoolError("pod %s has an empty %q label", klog.KObj(pod), p.servicePoolLabelKey())
 	}
 	if v1qos.GetPodQOS(pod) != v1.PodQOSGuaranteed {
 		return state.PodServiceAssignment{}, false, newServiceCPUPoolError("pod %s must be Guaranteed to use service CPU pools", klog.KObj(pod))

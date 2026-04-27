@@ -19,8 +19,10 @@ package cpumanager
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/validation"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/topology"
@@ -36,6 +38,9 @@ const (
 	StrictCPUReservationOption      string = "strict-cpu-reservation"
 	PreferAlignByUnCoreCacheOption  string = "prefer-align-cpus-by-uncorecache"
 	ServiceCPUPoolsOption           string = "service-cpu-pools"
+	ServiceCPUPoolsLabelKeyOption   string = "service-cpu-pools-label-key"
+
+	defaultServiceCPUPoolsLabelKey string = "service"
 )
 
 var (
@@ -46,6 +51,7 @@ var (
 		StrictCPUReservationOption,
 		PreferAlignByUnCoreCacheOption,
 		ServiceCPUPoolsOption,
+		ServiceCPUPoolsLabelKeyOption,
 	)
 	betaOptions = sets.New[string](
 		FullPCPUsOnlyOption,
@@ -99,11 +105,15 @@ type StaticPolicyOptions struct {
 	PreferAlignByUncoreCacheOption bool
 	// Flag to enable per-service shared CPU pools managed by the static policy.
 	ServiceCPUPools bool
+	// Label key used to group pods into per-service shared CPU pools.
+	ServiceCPUPoolsLabelKey string
 }
 
 // NewStaticPolicyOptions creates a StaticPolicyOptions struct from the user configuration.
 func NewStaticPolicyOptions(policyOptions map[string]string) (StaticPolicyOptions, error) {
-	opts := StaticPolicyOptions{}
+	opts := StaticPolicyOptions{
+		ServiceCPUPoolsLabelKey: defaultServiceCPUPoolsLabelKey,
+	}
 	for name, value := range policyOptions {
 		if err := CheckPolicyOptionAvailable(name); err != nil {
 			return opts, err
@@ -152,6 +162,11 @@ func NewStaticPolicyOptions(policyOptions map[string]string) (StaticPolicyOption
 				return opts, fmt.Errorf("bad value for option %q: %w", name, err)
 			}
 			opts.ServiceCPUPools = optValue
+		case ServiceCPUPoolsLabelKeyOption:
+			if errs := validation.IsQualifiedName(value); len(errs) != 0 {
+				return opts, fmt.Errorf("bad value for option %q: %s", name, strings.Join(errs, "; "))
+			}
+			opts.ServiceCPUPoolsLabelKey = value
 		default:
 			// this should never be reached, we already detect unknown options,
 			// but we keep it as further safety.
