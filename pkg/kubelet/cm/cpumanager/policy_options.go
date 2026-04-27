@@ -18,6 +18,7 @@ package cpumanager
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -39,8 +40,11 @@ const (
 	PreferAlignByUnCoreCacheOption  string = "prefer-align-cpus-by-uncorecache"
 	ServiceCPUPoolsOption           string = "service-cpu-pools"
 	ServiceCPUPoolsLabelKeyOption   string = "service-cpu-pools-label-key"
+	ServiceCPUPoolsBPFSyncOption    string = "service-cpu-pools-bpf-sync"
+	ServiceCPUPoolsBPFMapPathOption string = "service-cpu-pools-bpf-map-path"
 
-	defaultServiceCPUPoolsLabelKey string = "service"
+	defaultServiceCPUPoolsLabelKey   string = "service"
+	defaultServiceCPUPoolsBPFMapPath string = "/sys/fs/bpf/scx_awesome/app_cpuset"
 )
 
 var (
@@ -52,6 +56,8 @@ var (
 		PreferAlignByUnCoreCacheOption,
 		ServiceCPUPoolsOption,
 		ServiceCPUPoolsLabelKeyOption,
+		ServiceCPUPoolsBPFSyncOption,
+		ServiceCPUPoolsBPFMapPathOption,
 	)
 	betaOptions = sets.New[string](
 		FullPCPUsOnlyOption,
@@ -107,12 +113,17 @@ type StaticPolicyOptions struct {
 	ServiceCPUPools bool
 	// Label key used to group pods into per-service shared CPU pools.
 	ServiceCPUPoolsLabelKey string
+	// Flag to mirror service CPU pool cpusets into the sched_ext app cpuset BPF map.
+	ServiceCPUPoolsBPFSync bool
+	// Pinned sched_ext app cpuset BPF map path.
+	ServiceCPUPoolsBPFMapPath string
 }
 
 // NewStaticPolicyOptions creates a StaticPolicyOptions struct from the user configuration.
 func NewStaticPolicyOptions(policyOptions map[string]string) (StaticPolicyOptions, error) {
 	opts := StaticPolicyOptions{
-		ServiceCPUPoolsLabelKey: defaultServiceCPUPoolsLabelKey,
+		ServiceCPUPoolsLabelKey:   defaultServiceCPUPoolsLabelKey,
+		ServiceCPUPoolsBPFMapPath: defaultServiceCPUPoolsBPFMapPath,
 	}
 	for name, value := range policyOptions {
 		if err := CheckPolicyOptionAvailable(name); err != nil {
@@ -167,6 +178,14 @@ func NewStaticPolicyOptions(policyOptions map[string]string) (StaticPolicyOption
 				return opts, fmt.Errorf("bad value for option %q: %s", name, strings.Join(errs, "; "))
 			}
 			opts.ServiceCPUPoolsLabelKey = value
+		case ServiceCPUPoolsBPFSyncOption:
+			optValue, err := strconv.ParseBool(value)
+			if err != nil {
+				return opts, fmt.Errorf("bad value for option %q: %w", name, err)
+			}
+			opts.ServiceCPUPoolsBPFSync = optValue
+		case ServiceCPUPoolsBPFMapPathOption:
+			opts.ServiceCPUPoolsBPFMapPath = value
 		default:
 			// this should never be reached, we already detect unknown options,
 			// but we keep it as further safety.
@@ -189,6 +208,19 @@ func NewStaticPolicyOptions(policyOptions map[string]string) (StaticPolicyOption
 
 	if opts.PreferAlignByUncoreCacheOption && opts.DistributeCPUsAcrossNUMA {
 		return opts, fmt.Errorf("static policy options %s and %s can not be used at the same time", PreferAlignByUnCoreCacheOption, DistributeCPUsAcrossNUMAOption)
+	}
+
+	if opts.ServiceCPUPoolsBPFSync && !opts.ServiceCPUPools {
+		return opts, fmt.Errorf("static policy option %s requires %s to be enabled", ServiceCPUPoolsBPFSyncOption, ServiceCPUPoolsOption)
+	}
+
+	if opts.ServiceCPUPoolsBPFSync {
+		if opts.ServiceCPUPoolsBPFMapPath == "" {
+			return opts, fmt.Errorf("static policy option %s must not be empty when %s is enabled", ServiceCPUPoolsBPFMapPathOption, ServiceCPUPoolsBPFSyncOption)
+		}
+		if !filepath.IsAbs(opts.ServiceCPUPoolsBPFMapPath) {
+			return opts, fmt.Errorf("static policy option %s must be an absolute path when %s is enabled", ServiceCPUPoolsBPFMapPathOption, ServiceCPUPoolsBPFSyncOption)
+		}
 	}
 
 	return opts, nil

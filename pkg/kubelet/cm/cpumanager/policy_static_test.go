@@ -1360,7 +1360,8 @@ func TestStaticPolicyOptions(t *testing.T) {
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.CPUManagerPolicyAlphaOptions, true)
 
 	defaultOptions := StaticPolicyOptions{
-		ServiceCPUPoolsLabelKey: defaultServiceCPUPoolsLabelKey,
+		ServiceCPUPoolsLabelKey:   defaultServiceCPUPoolsLabelKey,
+		ServiceCPUPoolsBPFMapPath: defaultServiceCPUPoolsBPFMapPath,
 	}
 
 	testCases := []staticPolicyOptionTestCase{
@@ -1398,8 +1399,9 @@ func TestStaticPolicyOptions(t *testing.T) {
 			},
 			expectedError: false,
 			expectedValue: StaticPolicyOptions{
-				FullPhysicalCPUsOnly:    true,
-				ServiceCPUPoolsLabelKey: defaultServiceCPUPoolsLabelKey,
+				FullPhysicalCPUsOnly:      true,
+				ServiceCPUPoolsLabelKey:   defaultServiceCPUPoolsLabelKey,
+				ServiceCPUPoolsBPFMapPath: defaultServiceCPUPoolsBPFMapPath,
 			},
 		},
 		{
@@ -1410,9 +1412,72 @@ func TestStaticPolicyOptions(t *testing.T) {
 			},
 			expectedError: false,
 			expectedValue: StaticPolicyOptions{
-				ServiceCPUPools:         true,
-				ServiceCPUPoolsLabelKey: "example.com/service-pool",
+				ServiceCPUPools:           true,
+				ServiceCPUPoolsLabelKey:   "example.com/service-pool",
+				ServiceCPUPoolsBPFMapPath: defaultServiceCPUPoolsBPFMapPath,
 			},
+		},
+		{
+			description: "service pool BPF sync default map path",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsOption:        "true",
+				ServiceCPUPoolsBPFSyncOption: "true",
+			},
+			expectedError: false,
+			expectedValue: StaticPolicyOptions{
+				ServiceCPUPools:           true,
+				ServiceCPUPoolsLabelKey:   defaultServiceCPUPoolsLabelKey,
+				ServiceCPUPoolsBPFSync:    true,
+				ServiceCPUPoolsBPFMapPath: defaultServiceCPUPoolsBPFMapPath,
+			},
+		},
+		{
+			description: "service pool BPF sync custom map path",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsOption:           "true",
+				ServiceCPUPoolsBPFSyncOption:    "true",
+				ServiceCPUPoolsBPFMapPathOption: "/tmp/app_cpuset",
+			},
+			expectedError: false,
+			expectedValue: StaticPolicyOptions{
+				ServiceCPUPools:           true,
+				ServiceCPUPoolsLabelKey:   defaultServiceCPUPoolsLabelKey,
+				ServiceCPUPoolsBPFSync:    true,
+				ServiceCPUPoolsBPFMapPath: "/tmp/app_cpuset",
+			},
+		},
+		{
+			description: "service pool BPF sync bad bool",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsOption:        "true",
+				ServiceCPUPoolsBPFSyncOption: "enabled!",
+			},
+			expectedError: true,
+		},
+		{
+			description: "service pool BPF sync requires service pools",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsBPFSyncOption: "true",
+			},
+			expectedError: true,
+		},
+		{
+			description: "service pool BPF sync empty map path",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsOption:           "true",
+				ServiceCPUPoolsBPFSyncOption:    "true",
+				ServiceCPUPoolsBPFMapPathOption: "",
+			},
+			expectedError: true,
+		},
+		{
+			description: "service pool BPF sync relative map path",
+			policyOptions: map[string]string{
+				ServiceCPUPoolsOption:           "true",
+				ServiceCPUPoolsBPFSyncOption:    "true",
+				ServiceCPUPoolsBPFMapPathOption: "relative/app_cpuset",
+			},
+			expectedError: true,
 		},
 		{
 			description: "service pool empty label key",

@@ -154,6 +154,30 @@ func TestPolicyOptionsAvailable(t *testing.T) {
 			featureGateEnable: true,
 			expectedAvailable: false,
 		},
+		{
+			option:            ServiceCPUPoolsBPFSyncOption,
+			featureGate:       pkgfeatures.CPUManagerPolicyAlphaOptions,
+			featureGateEnable: true,
+			expectedAvailable: true,
+		},
+		{
+			option:            ServiceCPUPoolsBPFSyncOption,
+			featureGate:       pkgfeatures.CPUManagerPolicyBetaOptions,
+			featureGateEnable: true,
+			expectedAvailable: false,
+		},
+		{
+			option:            ServiceCPUPoolsBPFMapPathOption,
+			featureGate:       pkgfeatures.CPUManagerPolicyAlphaOptions,
+			featureGateEnable: true,
+			expectedAvailable: true,
+		},
+		{
+			option:            ServiceCPUPoolsBPFMapPathOption,
+			featureGate:       pkgfeatures.CPUManagerPolicyBetaOptions,
+			featureGateEnable: true,
+			expectedAvailable: false,
+		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.option, func(t *testing.T) {
@@ -269,6 +293,34 @@ func TestPolicyOptionsCompatibility(t *testing.T) {
 				DistributeCPUsAcrossCoresOption: "true",
 			},
 			expectedErr: true,
+		},
+		{
+			description: "service CPU pools BPF sync requires service CPU pools",
+			featureGate: pkgfeatures.CPUManagerPolicyAlphaOptions,
+			policyOptions: map[string]string{
+				ServiceCPUPoolsBPFSyncOption: "true",
+			},
+			expectedErr: true,
+		},
+		{
+			description: "service CPU pools BPF sync requires an absolute map path",
+			featureGate: pkgfeatures.CPUManagerPolicyAlphaOptions,
+			policyOptions: map[string]string{
+				ServiceCPUPoolsOption:           "true",
+				ServiceCPUPoolsBPFSyncOption:    "true",
+				ServiceCPUPoolsBPFMapPathOption: "relative/path",
+			},
+			expectedErr: true,
+		},
+		{
+			description: "service CPU pools BPF sync accepts absolute map path",
+			featureGate: pkgfeatures.CPUManagerPolicyAlphaOptions,
+			policyOptions: map[string]string{
+				ServiceCPUPoolsOption:           "true",
+				ServiceCPUPoolsBPFSyncOption:    "true",
+				ServiceCPUPoolsBPFMapPathOption: "/tmp/app_cpuset",
+			},
+			expectedErr: false,
 		},
 	}
 	for _, testCase := range testCases {

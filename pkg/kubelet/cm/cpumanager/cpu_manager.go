@@ -146,6 +146,15 @@ type manager struct {
 	// allocatableCPUs is the set of online CPUs as reported by the system,
 	// and available for allocation, minus the reserved set
 	allocatableCPUs cpuset.CPUSet
+
+	// appCPUSetStore mirrors service CPU pool cpusets into the sched_ext app cpuset BPF map.
+	appCPUSetStore appCPUSetStore
+
+	// appCPUSetSyncLock serializes BPF writes and lastSyncedAppCPUSet updates.
+	appCPUSetSyncLock sync.Mutex
+
+	// lastSyncedAppCPUSet tracks only app keys this kubelet process has written.
+	lastSyncedAppCPUSet map[string]cpuset.CPUSet
 }
 
 var _ Manager = &manager{}
@@ -213,6 +222,11 @@ func NewManager(cpuPolicyName string, cpuPolicyOptions map[string]string, reconc
 		stateFileDirectory:         stateFileDirectory,
 		allCPUs:                    topo.CPUDetails.CPUs(),
 	}
+	if staticPolicy, ok := policy.(*staticPolicy); ok && staticPolicy.options.ServiceCPUPoolsBPFSync {
+		manager.appCPUSetStore = newBPFAppCPUSetStore(staticPolicy.options.ServiceCPUPoolsBPFMapPath)
+		manager.lastSyncedAppCPUSet = make(map[string]cpuset.CPUSet)
+		klog.InfoS("Enabled sched_ext app cpuset BPF map sync", "mapPath", staticPolicy.options.ServiceCPUPoolsBPFMapPath)
+	}
 	manager.sourcesReady = &sourcesReadyStub{}
 	return manager, nil
 }
@@ -274,11 +288,17 @@ func (m *manager) Allocate(p *v1.Pod, c *v1.Container) error {
 
 func (m *manager) AddContainer(pod *v1.Pod, container *v1.Container, containerID string) {
 	m.Lock()
-	defer m.Unlock()
 	if cset, exists := m.state.GetCPUSet(string(pod.UID), container.Name); exists {
 		m.lastUpdateState.SetCPUSet(string(pod.UID), container.Name, cset)
 	}
 	m.containerMap.Add(string(pod.UID), container.Name, containerID)
+
+	service, cset, shouldSync := m.serviceAppCPUSetForContainer(string(pod.UID), container.Name)
+	m.Unlock()
+
+	if shouldSync {
+		m.syncServiceAppCPUSet(service, cset)
+	}
 }
 
 func (m *manager) RemoveContainer(containerID string) error {
@@ -402,7 +422,6 @@ func (m *manager) removeStaleState() {
 	// removing state that is newly added by an asynchronous call to
 	// AddContainer() during the execution of this code.
 	m.Lock()
-	defer m.Unlock()
 
 	// Get the list of active pods.
 	activePods := m.getActivePods()
@@ -445,8 +464,16 @@ func (m *manager) removeStaleState() {
 		}
 	})
 
+	currentServiceAssignments := state.ServiceCPUAssignments(nil)
 	if err := m.policy.ReconcileState(m.state, activePods); err != nil {
 		klog.ErrorS(err, "RemoveStaleState: failed to reconcile CPU manager state")
+	} else {
+		currentServiceAssignments = m.state.GetServiceCPUAssignments()
+	}
+	m.Unlock()
+
+	if currentServiceAssignments != nil {
+		m.clearStaleAppCPUSets(currentServiceAssignments)
 	}
 }
 
@@ -454,6 +481,7 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 	ctx := context.Background()
 	success = []reconciledContainer{}
 	failure = []reconciledContainer{}
+	serviceFailures := map[string]struct{}{}
 
 	m.removeStaleState()
 	for _, pod := range m.getActivePods() {
@@ -461,16 +489,21 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 		if !ok {
 			klog.V(5).InfoS("ReconcileState: skipping pod; status not found", "pod", klog.KObj(pod))
 			failure = append(failure, reconciledContainer{pod.Name, "", ""})
+			m.markPodServicePoolFailure(serviceFailures, pod)
 			continue
 		}
 
 		allContainers := pod.Spec.InitContainers
 		allContainers = append(allContainers, pod.Spec.Containers...)
 		for _, container := range allContainers {
+			service, servicePooled := m.serviceForContainer(string(pod.UID), container.Name)
 			containerID, err := findContainerIDByName(&pstatus, container.Name)
 			if err != nil {
 				klog.V(5).InfoS("ReconcileState: skipping container; ID not found in pod status", "pod", klog.KObj(pod), "containerName", container.Name, "err", err)
 				failure = append(failure, reconciledContainer{pod.Name, container.Name, ""})
+				if servicePooled {
+					serviceFailures[service] = struct{}{}
+				}
 				continue
 			}
 
@@ -478,6 +511,9 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 			if err != nil {
 				klog.V(5).InfoS("ReconcileState: skipping container; container status not found in pod status", "pod", klog.KObj(pod), "containerName", container.Name, "err", err)
 				failure = append(failure, reconciledContainer{pod.Name, container.Name, ""})
+				if servicePooled {
+					serviceFailures[service] = struct{}{}
+				}
 				continue
 			}
 
@@ -485,6 +521,9 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 				(cstatus.State.Waiting == nil && cstatus.State.Running == nil && cstatus.State.Terminated == nil) {
 				klog.V(4).InfoS("ReconcileState: skipping container; container still in the waiting state", "pod", klog.KObj(pod), "containerName", container.Name, "err", err)
 				failure = append(failure, reconciledContainer{pod.Name, container.Name, ""})
+				if servicePooled {
+					serviceFailures[service] = struct{}{}
+				}
 				continue
 			}
 
@@ -514,6 +553,9 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 				// NOTE: This should not happen outside of tests.
 				klog.V(2).InfoS("ReconcileState: skipping container; assigned cpuset is empty", "pod", klog.KObj(pod), "containerName", container.Name)
 				failure = append(failure, reconciledContainer{pod.Name, container.Name, containerID})
+				if servicePooled {
+					serviceFailures[service] = struct{}{}
+				}
 				continue
 			}
 
@@ -524,6 +566,9 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 				if err != nil {
 					klog.ErrorS(err, "ReconcileState: failed to update container", "pod", klog.KObj(pod), "containerName", container.Name, "containerID", containerID, "cpuSet", cset)
 					failure = append(failure, reconciledContainer{pod.Name, container.Name, containerID})
+					if servicePooled {
+						serviceFailures[service] = struct{}{}
+					}
 					continue
 				}
 				m.lastUpdateState.SetCPUSet(string(pod.UID), container.Name, cset)
@@ -531,7 +576,103 @@ func (m *manager) reconcileState() (success []reconciledContainer, failure []rec
 			success = append(success, reconciledContainer{pod.Name, container.Name, containerID})
 		}
 	}
+	m.syncCurrentServiceAppCPUSets(serviceFailures)
 	return success, failure
+}
+
+func (m *manager) serviceForContainer(podUID, containerName string) (string, bool) {
+	if m.appCPUSetStore == nil || m.state == nil {
+		return "", false
+	}
+	assignment, ok := m.state.GetContainerAssignment(podUID, containerName)
+	if !ok || assignment.AssignmentType != state.CPUAssignmentServicePool {
+		return "", false
+	}
+	podAssignment, ok := m.state.GetPodServiceAssignment(podUID)
+	if !ok || podAssignment.Service == "" {
+		return "", false
+	}
+	return podAssignment.Service, true
+}
+
+func (m *manager) serviceAppCPUSetForContainer(podUID, containerName string) (string, cpuset.CPUSet, bool) {
+	service, ok := m.serviceForContainer(podUID, containerName)
+	if !ok {
+		return "", cpuset.CPUSet{}, false
+	}
+	assignment, ok := m.state.GetServiceCPUAssignment(service)
+	if !ok || assignment.CPUSet.IsEmpty() {
+		return "", cpuset.CPUSet{}, false
+	}
+	return service, assignment.CPUSet.Clone(), true
+}
+
+func (m *manager) markPodServicePoolFailure(serviceFailures map[string]struct{}, pod *v1.Pod) {
+	if pod == nil {
+		return
+	}
+	for _, container := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+		if service, ok := m.serviceForContainer(string(pod.UID), container.Name); ok {
+			serviceFailures[service] = struct{}{}
+		}
+	}
+}
+
+func (m *manager) syncCurrentServiceAppCPUSets(serviceFailures map[string]struct{}) {
+	if m.appCPUSetStore == nil || m.state == nil {
+		return
+	}
+	currentServiceAssignments := m.state.GetServiceCPUAssignments()
+	for service, assignment := range currentServiceAssignments {
+		if _, failed := serviceFailures[service]; failed {
+			klog.V(4).InfoS("Skipping sched_ext app cpuset BPF map sync because cgroup cpuset update did not complete", "app", service, "cpuSet", assignment.CPUSet)
+			continue
+		}
+		m.syncServiceAppCPUSet(service, assignment.CPUSet)
+	}
+	m.clearStaleAppCPUSets(currentServiceAssignments)
+}
+
+func (m *manager) syncServiceAppCPUSet(service string, cset cpuset.CPUSet) {
+	if m.appCPUSetStore == nil {
+		return
+	}
+	m.appCPUSetSyncLock.Lock()
+	defer m.appCPUSetSyncLock.Unlock()
+
+	if m.lastSyncedAppCPUSet == nil {
+		m.lastSyncedAppCPUSet = make(map[string]cpuset.CPUSet)
+	}
+	if last, ok := m.lastSyncedAppCPUSet[service]; ok && last.Equals(cset) {
+		return
+	}
+	if err := m.appCPUSetStore.Set(service, cset); err != nil {
+		klog.ErrorS(err, "Failed to sync service CPU pool to sched_ext app cpuset BPF map", "app", service, "cpuSet", cset)
+		return
+	}
+	m.lastSyncedAppCPUSet[service] = cset.Clone()
+}
+
+func (m *manager) clearStaleAppCPUSets(currentServiceAssignments state.ServiceCPUAssignments) {
+	if m.appCPUSetStore == nil {
+		return
+	}
+	m.appCPUSetSyncLock.Lock()
+	defer m.appCPUSetSyncLock.Unlock()
+
+	if len(m.lastSyncedAppCPUSet) == 0 {
+		return
+	}
+	for service := range m.lastSyncedAppCPUSet {
+		if _, ok := currentServiceAssignments[service]; ok {
+			continue
+		}
+		if err := m.appCPUSetStore.Clear(service); err != nil {
+			klog.ErrorS(err, "Failed to clear service CPU pool from sched_ext app cpuset BPF map", "app", service)
+			continue
+		}
+		delete(m.lastSyncedAppCPUSet, service)
+	}
 }
 
 func findContainerIDByName(status *v1.PodStatus, name string) (string, error) {

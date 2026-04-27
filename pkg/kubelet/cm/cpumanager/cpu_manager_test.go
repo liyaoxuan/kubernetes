@@ -218,20 +218,64 @@ func (p *mockPolicy) GetAllocatableCPUs(m state.State) cpuset.CPUSet {
 }
 
 type mockRuntimeService struct {
-	err error
+	err      error
+	errByID  map[string]error
+	onUpdate func(id string, resources *runtimeapi.ContainerResources)
 }
 
 func (rt mockRuntimeService) UpdateContainerResources(_ context.Context, id string, resources *runtimeapi.ContainerResources) error {
+	if rt.onUpdate != nil {
+		rt.onUpdate(id, resources)
+	}
+	if err, ok := rt.errByID[id]; ok {
+		return err
+	}
 	return rt.err
 }
 
 type mockPodStatusProvider struct {
-	podStatus v1.PodStatus
-	found     bool
+	podStatus   v1.PodStatus
+	found       bool
+	podStatuses map[types.UID]v1.PodStatus
 }
 
 func (psp mockPodStatusProvider) GetPodStatus(uid types.UID) (v1.PodStatus, bool) {
+	if psp.podStatuses != nil {
+		status, ok := psp.podStatuses[uid]
+		return status, ok
+	}
 	return psp.podStatus, psp.found
+}
+
+type fakeAppCPUSetStore struct {
+	setErr   error
+	clearErr error
+	onSet    func(app string, cset cpuset.CPUSet)
+	onClear  func(app string)
+
+	sets   []fakeAppCPUSetUpdate
+	clears []string
+}
+
+type fakeAppCPUSetUpdate struct {
+	app  string
+	cset cpuset.CPUSet
+}
+
+func (f *fakeAppCPUSetStore) Set(app string, cset cpuset.CPUSet) error {
+	if f.onSet != nil {
+		f.onSet(app, cset)
+	}
+	f.sets = append(f.sets, fakeAppCPUSetUpdate{app: app, cset: cset.Clone()})
+	return f.setErr
+}
+
+func (f *fakeAppCPUSetStore) Clear(app string) error {
+	if f.onClear != nil {
+		f.onClear(app)
+	}
+	f.clears = append(f.clears, app)
+	return f.clearErr
 }
 
 func makePod(podUID, containerName, cpuRequest, cpuLimit string) *v1.Pod {
@@ -258,6 +302,20 @@ func makePod(podUID, containerName, cpuRequest, cpuLimit string) *v1.Pod {
 	pod.Spec.Containers[0].Name = containerName
 
 	return pod
+}
+
+func runningPodStatus(containerName, containerID string) v1.PodStatus {
+	return v1.PodStatus{
+		ContainerStatuses: []v1.ContainerStatus{
+			{
+				Name:        containerName,
+				ContainerID: "docker://" + containerID,
+				State: v1.ContainerState{
+					Running: &v1.ContainerStateRunning{},
+				},
+			},
+		},
+	}
 }
 
 func makeMultiContainerPod(initCPUs, appCPUs []struct{ request, limit string }) *v1.Pod {
@@ -1383,6 +1441,328 @@ func TestReconcileState(t *testing.T) {
 	}
 }
 
+func TestCPUManagerReconcileServicePoolBPFSyncAfterCgroupUpdates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sched_ext app cpuset BPF map sync is Linux-specific")
+	}
+
+	pool := cpuset.New(1, 2)
+	podA := makePod("pod-a", "container-a", "1", "1")
+	podA.Name = "pod-a"
+	podB := makePod("pod-b", "container-b", "1", "1")
+	podB.Name = "pod-b"
+
+	events := []string{}
+	store := &fakeAppCPUSetStore{
+		onSet: func(app string, cset cpuset.CPUSet) {
+			events = append(events, "bpf:set:"+app)
+		},
+	}
+	mgr := &manager{
+		policy: &mockPolicy{},
+		state: &mockState{
+			assignments: state.ContainerCPUAssignments{
+				"pod-a": {
+					"container-a": pool,
+				},
+				"pod-b": {
+					"container-b": pool,
+				},
+			},
+			containerAssignments: state.ContainerAssignments{
+				"pod-a": {
+					"container-a": {
+						AssignmentType: state.CPUAssignmentServicePool,
+					},
+				},
+				"pod-b": {
+					"container-b": {
+						AssignmentType: state.CPUAssignmentServicePool,
+					},
+				},
+			},
+			serviceAssignments: state.ServiceCPUAssignments{
+				"service-a": {
+					CPUSet:        pool,
+					RequestedCPUs: 2,
+				},
+			},
+			podServiceAssignments: state.PodServiceAssignments{
+				"pod-a": {
+					Service:       "service-a",
+					RequestedCPUs: 1,
+				},
+				"pod-b": {
+					Service:       "service-a",
+					RequestedCPUs: 1,
+				},
+			},
+			defaultCPUSet: cpuset.New(0, 3),
+		},
+		lastUpdateState: state.NewMemoryState(),
+		containerRuntime: mockRuntimeService{
+			onUpdate: func(id string, resources *runtimeapi.ContainerResources) {
+				events = append(events, "cgroup:"+id)
+			},
+		},
+		containerMap: containermap.NewContainerMap(),
+		activePods: func() []*v1.Pod {
+			return []*v1.Pod{podA, podB}
+		},
+		podStatusProvider: mockPodStatusProvider{
+			podStatuses: map[types.UID]v1.PodStatus{
+				"pod-a": runningPodStatus("container-a", "container-a"),
+				"pod-b": runningPodStatus("container-b", "container-b"),
+			},
+		},
+		sourcesReady:        &sourcesReadyStub{},
+		appCPUSetStore:      store,
+		lastSyncedAppCPUSet: map[string]cpuset.CPUSet{},
+	}
+
+	success, failure := mgr.reconcileState()
+	if len(failure) != 0 {
+		t.Fatalf("unexpected reconcile failures: %#v", failure)
+	}
+	if len(success) != 2 {
+		t.Fatalf("expected two reconciled containers, got %d", len(success))
+	}
+	expectedEvents := []string{"cgroup:container-a", "cgroup:container-b", "bpf:set:service-a"}
+	if !reflect.DeepEqual(events, expectedEvents) {
+		t.Fatalf("unexpected update order: got %v want %v", events, expectedEvents)
+	}
+	if len(store.sets) != 1 {
+		t.Fatalf("expected one BPF set for the service pool, got %d", len(store.sets))
+	}
+	if store.sets[0].app != "service-a" || !store.sets[0].cset.Equals(pool) {
+		t.Fatalf("unexpected BPF set: %#v", store.sets[0])
+	}
+}
+
+func TestCPUManagerReconcileServicePoolCgroupFailureSkipsBPFSync(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sched_ext app cpuset BPF map sync is Linux-specific")
+	}
+
+	pool := cpuset.New(1, 2)
+	pod := makePod("pod-a", "container-a", "1", "1")
+	store := &fakeAppCPUSetStore{}
+	mgr := &manager{
+		policy: &mockPolicy{},
+		state: &mockState{
+			assignments: state.ContainerCPUAssignments{
+				"pod-a": {
+					"container-a": pool,
+				},
+			},
+			containerAssignments: state.ContainerAssignments{
+				"pod-a": {
+					"container-a": {
+						AssignmentType: state.CPUAssignmentServicePool,
+					},
+				},
+			},
+			serviceAssignments: state.ServiceCPUAssignments{
+				"service-a": {
+					CPUSet:        pool,
+					RequestedCPUs: 1,
+				},
+			},
+			podServiceAssignments: state.PodServiceAssignments{
+				"pod-a": {
+					Service:       "service-a",
+					RequestedCPUs: 1,
+				},
+			},
+			defaultCPUSet: cpuset.New(0, 3),
+		},
+		lastUpdateState: state.NewMemoryState(),
+		containerRuntime: mockRuntimeService{
+			errByID: map[string]error{
+				"container-a": fmt.Errorf("cgroup update failed"),
+			},
+		},
+		containerMap: containermap.NewContainerMap(),
+		activePods: func() []*v1.Pod {
+			return []*v1.Pod{pod}
+		},
+		podStatusProvider: mockPodStatusProvider{
+			podStatuses: map[types.UID]v1.PodStatus{
+				"pod-a": runningPodStatus("container-a", "container-a"),
+			},
+		},
+		sourcesReady:        &sourcesReadyStub{},
+		appCPUSetStore:      store,
+		lastSyncedAppCPUSet: map[string]cpuset.CPUSet{},
+	}
+
+	_, failure := mgr.reconcileState()
+	if len(failure) != 1 {
+		t.Fatalf("expected one reconcile failure, got %d", len(failure))
+	}
+	if len(store.sets) != 0 {
+		t.Fatalf("expected BPF sync to be skipped after cgroup failure, got %#v", store.sets)
+	}
+	if len(mgr.lastSyncedAppCPUSet) != 0 {
+		t.Fatalf("expected no last-synced BPF state after skipped sync, got %#v", mgr.lastSyncedAppCPUSet)
+	}
+}
+
+func TestCPUManagerReconcileServicePoolBPFFailureRetries(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sched_ext app cpuset BPF map sync is Linux-specific")
+	}
+
+	pool := cpuset.New(1, 2)
+	pod := makePod("pod-a", "container-a", "1", "1")
+	store := &fakeAppCPUSetStore{setErr: fmt.Errorf("BPF update failed")}
+	mgr := &manager{
+		policy: &mockPolicy{},
+		state: &mockState{
+			assignments: state.ContainerCPUAssignments{
+				"pod-a": {
+					"container-a": pool,
+				},
+			},
+			containerAssignments: state.ContainerAssignments{
+				"pod-a": {
+					"container-a": {
+						AssignmentType: state.CPUAssignmentServicePool,
+					},
+				},
+			},
+			serviceAssignments: state.ServiceCPUAssignments{
+				"service-a": {
+					CPUSet:        pool,
+					RequestedCPUs: 1,
+				},
+			},
+			podServiceAssignments: state.PodServiceAssignments{
+				"pod-a": {
+					Service:       "service-a",
+					RequestedCPUs: 1,
+				},
+			},
+			defaultCPUSet: cpuset.New(0, 3),
+		},
+		lastUpdateState: state.NewMemoryState(),
+		containerRuntime: mockRuntimeService{
+			err: nil,
+		},
+		containerMap: containermap.NewContainerMap(),
+		activePods: func() []*v1.Pod {
+			return []*v1.Pod{pod}
+		},
+		podStatusProvider: mockPodStatusProvider{
+			podStatuses: map[types.UID]v1.PodStatus{
+				"pod-a": runningPodStatus("container-a", "container-a"),
+			},
+		},
+		sourcesReady:        &sourcesReadyStub{},
+		appCPUSetStore:      store,
+		lastSyncedAppCPUSet: map[string]cpuset.CPUSet{},
+	}
+
+	mgr.reconcileState()
+	if len(store.sets) != 1 {
+		t.Fatalf("expected first BPF sync attempt, got %d", len(store.sets))
+	}
+	if len(mgr.lastSyncedAppCPUSet) != 0 {
+		t.Fatalf("expected failed BPF sync to preserve retry state, got %#v", mgr.lastSyncedAppCPUSet)
+	}
+
+	store.setErr = nil
+	mgr.reconcileState()
+	if len(store.sets) != 2 {
+		t.Fatalf("expected second reconcile to retry BPF sync, got %d attempts", len(store.sets))
+	}
+	if got, ok := mgr.lastSyncedAppCPUSet["service-a"]; !ok || !got.Equals(pool) {
+		t.Fatalf("expected successful retry to update last-synced BPF state, got %q, %t", got, ok)
+	}
+}
+
+func TestCPUManagerAddContainerServicePoolSyncsBPFOnce(t *testing.T) {
+	pool := cpuset.New(1, 2)
+	pod := makePod("pod-a", "container-a", "1", "1")
+	store := &fakeAppCPUSetStore{}
+	mgr := &manager{
+		state: &mockState{
+			assignments: state.ContainerCPUAssignments{
+				"pod-a": {
+					"container-a": pool,
+				},
+			},
+			containerAssignments: state.ContainerAssignments{
+				"pod-a": {
+					"container-a": {
+						AssignmentType: state.CPUAssignmentServicePool,
+					},
+				},
+			},
+			serviceAssignments: state.ServiceCPUAssignments{
+				"service-a": {
+					CPUSet:        pool,
+					RequestedCPUs: 1,
+				},
+			},
+			podServiceAssignments: state.PodServiceAssignments{
+				"pod-a": {
+					Service:       "service-a",
+					RequestedCPUs: 1,
+				},
+			},
+		},
+		lastUpdateState:     state.NewMemoryState(),
+		containerMap:        containermap.NewContainerMap(),
+		appCPUSetStore:      store,
+		lastSyncedAppCPUSet: map[string]cpuset.CPUSet{},
+	}
+
+	mgr.AddContainer(pod, &pod.Spec.Containers[0], "container-a")
+	if len(store.sets) != 1 {
+		t.Fatalf("expected AddContainer to sync BPF once, got %d", len(store.sets))
+	}
+	if store.sets[0].app != "service-a" || !store.sets[0].cset.Equals(pool) {
+		t.Fatalf("unexpected BPF set: %#v", store.sets[0])
+	}
+	if _, _, err := mgr.containerMap.GetContainerRef("container-a"); err != nil {
+		t.Fatalf("expected AddContainer to record container ID: %v", err)
+	}
+
+	mgr.AddContainer(pod, &pod.Spec.Containers[0], "container-a")
+	if len(store.sets) != 1 {
+		t.Fatalf("expected duplicate AddContainer to skip unchanged BPF sync, got %d", len(store.sets))
+	}
+}
+
+func TestCPUManagerClearStaleServicePoolBPFState(t *testing.T) {
+	pool := cpuset.New(1, 2)
+	store := &fakeAppCPUSetStore{}
+	mgr := &manager{
+		appCPUSetStore: store,
+		lastSyncedAppCPUSet: map[string]cpuset.CPUSet{
+			"service-a": pool,
+			"service-b": pool,
+		},
+	}
+
+	mgr.clearStaleAppCPUSets(state.ServiceCPUAssignments{
+		"service-b": {
+			CPUSet:        pool,
+			RequestedCPUs: 1,
+		},
+	})
+	if !reflect.DeepEqual(store.clears, []string{"service-a"}) {
+		t.Fatalf("unexpected BPF clears: got %v want [service-a]", store.clears)
+	}
+	if _, ok := mgr.lastSyncedAppCPUSet["service-a"]; ok {
+		t.Fatalf("expected cleared app to be removed from last-synced state")
+	}
+	if got, ok := mgr.lastSyncedAppCPUSet["service-b"]; !ok || !got.Equals(pool) {
+		t.Fatalf("expected current app to remain in last-synced state, got %q, %t", got, ok)
+	}
+}
+
 // above test cases are without kubelet --reserved-cpus cmd option
 // the following tests are with --reserved-cpus configured
 func TestCPUManagerAddWithResvList(t *testing.T) {
@@ -1530,6 +1910,68 @@ func TestCPUManagerHandlePolicyOptions(t *testing.T) {
 			}
 		})
 
+	}
+}
+
+func TestCPUManagerServicePoolBPFSyncInitializesStore(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CPUManagerPolicyAlphaOptions, true)
+
+	machineInfo := &cadvisorapi.MachineInfo{
+		NumCores: 4,
+		Topology: []cadvisorapi.Node{
+			{
+				Cores: []cadvisorapi.Core{
+					{
+						Id:      0,
+						Threads: []int{0},
+					},
+					{
+						Id:      1,
+						Threads: []int{1},
+					},
+					{
+						Id:      2,
+						Threads: []int{2},
+					},
+					{
+						Id:      3,
+						Threads: []int{3},
+					},
+				},
+			},
+		},
+	}
+	stateDir, err := os.MkdirTemp("", "cpu_manager_bpf_sync_test")
+	if err != nil {
+		t.Fatalf("cannot create state file directory: %v", err)
+	}
+	defer os.RemoveAll(stateDir)
+
+	mgr, err := NewManager(
+		string(PolicyStatic),
+		map[string]string{
+			ServiceCPUPoolsOption:           "true",
+			ServiceCPUPoolsBPFSyncOption:    "true",
+			ServiceCPUPoolsBPFMapPathOption: "/tmp/missing-app-cpuset",
+		},
+		5*time.Second,
+		machineInfo,
+		cpuset.New(0),
+		v1.ResourceList{
+			v1.ResourceCPU: resource.MustParse("1"),
+		},
+		stateDir,
+		topologymanager.NewFakeManager(),
+	)
+	if err != nil {
+		t.Fatalf("expected NewManager to avoid opening absent BPF map path, got error: %v", err)
+	}
+	cpuManager := mgr.(*manager)
+	if cpuManager.appCPUSetStore == nil {
+		t.Fatalf("expected BPF app cpuset store to be initialized")
+	}
+	if len(cpuManager.lastSyncedAppCPUSet) != 0 {
+		t.Fatalf("expected empty last-synced app cpuset map, got %#v", cpuManager.lastSyncedAppCPUSet)
 	}
 }
 
